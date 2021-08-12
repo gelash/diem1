@@ -1,10 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_global_constants::{OWNER_ACCOUNT, OWNER_KEY};
-use libra_management::{constants, error::Error, secure_backend::SharedBackend};
-use libra_network_address::NetworkAddress;
-use libra_types::{account_address, transaction::Transaction};
+use diem_global_constants::OWNER_ACCOUNT;
+use diem_management::{constants, error::Error, secure_backend::SharedBackend};
+use diem_types::{network_address::NetworkAddress, transaction::Transaction};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -12,13 +11,15 @@ pub struct ValidatorConfig {
     #[structopt(long)]
     owner_name: String,
     #[structopt(flatten)]
-    validator_config: libra_management::validator_config::ValidatorConfig,
+    validator_config: diem_management::validator_config::ValidatorConfig,
     #[structopt(long)]
     validator_address: NetworkAddress,
     #[structopt(long)]
     fullnode_address: NetworkAddress,
     #[structopt(flatten)]
     shared_backend: SharedBackend,
+    #[structopt(long, help = "Disables network address validation")]
+    disable_address_validation: bool,
 }
 
 impl ValidatorConfig {
@@ -29,10 +30,8 @@ impl ValidatorConfig {
             .override_shared_backend(&self.shared_backend.shared_backend)?;
 
         // Retrieve and set owner account
-        let owner_shared_storage = config.shared_backend_with_namespace(self.owner_name.clone());
-        let owner_key = owner_shared_storage.ed25519_key(OWNER_KEY)?;
-        let owner_account = account_address::from_public_key(&owner_key);
-
+        let owner_account =
+            diem_config::utils::validator_owner_account_from_name(self.owner_name.as_bytes());
         let mut validator_storage = config.validator_backend();
         validator_storage.set(OWNER_ACCOUNT, owner_account)?;
 
@@ -41,6 +40,7 @@ impl ValidatorConfig {
             self.fullnode_address,
             self.validator_address,
             false,
+            self.disable_address_validation,
         )?;
 
         // Upload the validator config to shared storage

@@ -1,25 +1,34 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     counters,
-    errors::JsonRpcError,
-    methods::{build_registry, JsonRpcRequest, JsonRpcService, RpcRegistry},
+    errors::is_internal_error,
+    methods::{Handler, JsonRpcService},
+    response::{JsonRpcResponse, X_DIEM_CHAIN_ID, X_DIEM_TIMESTAMP_USEC_ID, X_DIEM_VERSION_ID},
+    util::{sdk_info_from_user_agent, SdkInfo},
 };
-use futures::future::join_all;
-use libra_config::config::{NodeConfig, RoleType};
-use libra_json_rpc_types::views::{
-    JSONRPC_LIBRA_CHAIN_ID, JSONRPC_LIBRA_LEDGER_TIMESTAMPUSECS, JSONRPC_LIBRA_LEDGER_VERSION,
+use anyhow::{ensure, Result};
+use diem_config::config::{NodeConfig, RoleType};
+use diem_json_rpc_types::Method;
+use diem_logger::{debug, Schema};
+use diem_mempool::MempoolClientSender;
+use diem_types::{chain_id::ChainId, ledger_info::LedgerInfoWithSignatures};
+use futures::future::{join_all, Either};
+use rand::{rngs::OsRng, RngCore};
+use serde_json::Value;
+use std::{
+    net::SocketAddr,
+    ops::Sub,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use libra_mempool::MempoolClientSender;
-use libra_types::{chain_id::ChainId, ledger_info::LedgerInfoWithSignatures};
-use serde_json::{map::Map, Value};
-use std::{net::SocketAddr, sync::Arc};
 use storage_interface::DbReader;
 use tokio::runtime::{Builder, Runtime};
 use warp::{
+    http::header,
     reject::{self, Reject},
-    Filter,
+    Filter, Reply,
 };
 
 // Counter labels for runtime metrics
@@ -28,6 +37,61 @@ const LABEL_SUCCESS: &str = "success";
 const LABEL_BATCH: &str = "batch";
 const LABEL_SINGLE: &str = "single";
 
+#[derive(Schema)]
+struct HttpRequestLog<'a> {
+    #[schema(display)]
+    remote_addr: Option<std::net::SocketAddr>,
+    method: String,
+    path: String,
+    status: u16,
+    referer: Option<&'a str>,
+    user_agent: Option<&'a str>,
+    #[schema(debug)]
+    elapsed: std::time::Duration,
+    forwarded: Option<&'a str>,
+}
+
+#[derive(Schema)]
+struct RpcRequestLog<'a> {
+    trace_id: &'a str,
+    request: &'a Value,
+}
+
+#[derive(Schema)]
+struct RpcResponseLog<'a> {
+    trace_id: &'a str,
+    is_batch: bool,
+    response_error: bool,
+    response: &'a JsonRpcResponse,
+}
+
+// HealthCheckParams is optional params for different layer's health check.
+// If no param is provided, server return 200 by default to indicate HTTP server is running health.
+#[derive(serde::Deserialize)]
+struct HealthCheckParams {
+    // Health check returns 200 when this param is provided and meet the following condition:
+    //   server latest ledger info timestamp >= server current time timestamp + duration_secs
+    pub duration_secs: Option<u64>,
+}
+
+#[macro_export]
+macro_rules! log_response {
+    ($trace_id: expr, $resp: expr, $is_batch: expr) => {
+        let log = RpcResponseLog {
+            trace_id: $trace_id,
+            is_batch: $is_batch,
+            response_error: $resp.error.is_some(),
+            response: $resp,
+        };
+        match &$resp.error {
+            Some(error) if is_internal_error(&error.code) => {
+                diem_logger::error!(log)
+            }
+            _ => diem_logger::trace!(log),
+        }
+    };
+}
+
 /// Creates HTTP server (warp-based) that serves JSON RPC requests
 /// Returns handle to corresponding Tokio runtime
 pub fn bootstrap(
@@ -35,21 +99,21 @@ pub fn bootstrap(
     batch_size_limit: u16,
     page_size_limit: u16,
     content_len_limit: usize,
-    libra_db: Arc<dyn DbReader>,
+    tls_cert_path: &Option<String>,
+    tls_key_path: &Option<String>,
+    diem_db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
     role: RoleType,
     chain_id: ChainId,
 ) -> Runtime {
-    let runtime = Builder::new()
-        .thread_name("rpc-")
-        .threaded_scheduler()
+    let runtime = Builder::new_multi_thread()
+        .thread_name("json-rpc")
         .enable_all()
         .build()
-        .expect("[rpc] failed to create runtime");
+        .expect("[json-rpc] failed to create runtime");
 
-    let registry = Arc::new(build_registry());
     let service = JsonRpcService::new(
-        libra_db,
+        diem_db.clone(),
         mp_sender,
         role,
         chain_id,
@@ -63,8 +127,33 @@ pub fn bootstrap(
         .and(warp::body::content_length_limit(content_len_limit as u64))
         .and(warp::body::json())
         .and(warp::any().map(move || service.clone()))
-        .and(warp::any().map(move || Arc::clone(&registry)))
-        .and_then(rpc_endpoint);
+        .and(warp::filters::header::optional::<String>("user-agent"))
+        .and_then(rpc_endpoint)
+        .with(warp::log::custom(|info| {
+            debug!(HttpRequestLog {
+                remote_addr: info.remote_addr(),
+                method: info.method().to_string(),
+                path: info.path().to_string(),
+                status: info.status().as_u16(),
+                referer: info.referer(),
+                user_agent: info.user_agent(),
+                elapsed: info.elapsed(),
+                forwarded: info
+                    .request_headers()
+                    .get(header::FORWARDED)
+                    .and_then(|v| v.to_str().ok())
+            })
+        }))
+        // CORS is required for full node server to accept requests from different domain web pages.
+        // It needs to be configured for the json-rpc request accepting method and headers.
+        // Technically it's fine for any headers, but for simplicity we only set must have header
+        // content-type.
+        .with(
+            warp::cors()
+                .allow_any_origin()
+                .allow_methods(vec!["POST"])
+                .allow_headers(vec![header::CONTENT_TYPE]),
+        );
 
     // For now we still allow user to use "/", but user should start to move to "/v1" soon
     let route_root = warp::path::end().and(base_route.clone());
@@ -75,7 +164,10 @@ pub fn bootstrap(
 
     let health_route = warp::path!("-" / "healthy")
         .and(warp::path::end())
-        .map(|| "libra-node:ok");
+        .and(warp::query().map(move |params: HealthCheckParams| params))
+        .and(warp::any().map(move || diem_db.clone()))
+        .and(warp::any().map(SystemTime::now))
+        .and_then(health_check);
 
     let full_route = health_route.or(route_v1.or(route_root));
 
@@ -86,7 +178,17 @@ pub fn bootstrap(
     //
     // Note: we need to enter the runtime context first to actually bind, since
     //       tokio TcpListener can only be bound inside a tokio context.
-    let server = runtime.enter(move || warp::serve(full_route).bind(address));
+    let _guard = runtime.enter();
+    let server = match tls_cert_path {
+        None => Either::Left(warp::serve(full_route).bind(address)),
+        Some(cert_path) => Either::Right(
+            warp::serve(full_route)
+                .tls()
+                .cert_path(cert_path)
+                .key_path(tls_key_path.as_ref().unwrap())
+                .bind(address),
+        ),
+    };
     runtime.handle().spawn(server);
     runtime
 }
@@ -95,37 +197,69 @@ pub fn bootstrap(
 pub fn bootstrap_from_config(
     config: &NodeConfig,
     chain_id: ChainId,
-    libra_db: Arc<dyn DbReader>,
+    diem_db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
 ) -> Runtime {
     bootstrap(
-        config.rpc.address,
-        config.rpc.batch_size_limit,
-        config.rpc.page_size_limit,
-        config.rpc.content_length_limit,
-        libra_db,
+        config.json_rpc.address,
+        config.json_rpc.batch_size_limit,
+        config.json_rpc.page_size_limit,
+        config.json_rpc.content_length_limit,
+        &config.json_rpc.tls_cert_path,
+        &config.json_rpc.tls_key_path,
+        diem_db,
         mp_sender,
         config.base.role,
         chain_id,
     )
 }
 
+async fn health_check(
+    params: HealthCheckParams,
+    db: Arc<dyn DbReader>,
+    now: SystemTime,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    if let Some(duration) = params.duration_secs {
+        let ledger_info = db
+            .get_latest_ledger_info()
+            .map_err(|_| reject::custom(HealthCheckError))?;
+        let timestamp = ledger_info.ledger_info().timestamp_usecs();
+
+        check_latest_ledger_info_timestamp(duration, timestamp, now)
+            .map_err(|_| reject::custom(HealthCheckError))?;
+    }
+    Ok(Box::new("diem-node:ok"))
+}
+
+pub fn check_latest_ledger_info_timestamp(
+    duration_sec: u64,
+    timestamp_usecs: u64,
+    now: SystemTime,
+) -> Result<()> {
+    let timestamp = Duration::from_micros(timestamp_usecs);
+    let expectation = now
+        .sub(Duration::from_secs(duration_sec))
+        .duration_since(UNIX_EPOCH)?;
+    ensure!(timestamp >= expectation);
+    Ok(())
+}
+
 /// JSON RPC entry point
 /// Handles all incoming rpc requests
-/// Performs routing based on methods defined in `registry`
 pub(crate) async fn rpc_endpoint(
     data: Value,
     service: JsonRpcService,
-    registry: Arc<RpcRegistry>,
-) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    user_agent: Option<String>,
+) -> Result<warp::reply::Response, warp::Rejection> {
     let label = match data {
         Value::Array(_) => LABEL_BATCH,
         _ => LABEL_SINGLE,
     };
-    let timer = counters::REQUEST_LATENCY
+    counters::RPC_REQUESTS.with_label_values(&[label]).inc();
+    let timer = counters::RPC_REQUEST_LATENCY
         .with_label_values(&[label])
         .start_timer();
-    let ret = rpc_endpoint_without_metrics(data, service, registry).await;
+    let ret = rpc_endpoint_without_metrics(data, service, user_agent.as_deref()).await;
     timer.stop_and_record();
     ret
 }
@@ -133,210 +267,170 @@ pub(crate) async fn rpc_endpoint(
 async fn rpc_endpoint_without_metrics(
     data: Value,
     service: JsonRpcService,
-    registry: Arc<RpcRegistry>,
-) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    user_agent: Option<&str>,
+) -> Result<warp::reply::Response, warp::Rejection> {
     // take snapshot of latest version of DB to be used across all requests, especially for batched requests
     let ledger_info = service
         .get_latest_ledger_info()
         .map_err(|_| reject::custom(DatabaseError))?;
 
-    let resp = Ok(if let Value::Array(requests) = data {
+    let mut rng = OsRng;
+    let trace_id = format!("{:x}", rng.next_u64());
+    debug!(RpcRequestLog {
+        trace_id: &trace_id,
+        request: &data,
+    });
+    let chain_id = service.chain_id();
+    let latest_ledger_version = ledger_info.ledger_info().version();
+    let latest_ledger_timestamp_usecs = ledger_info.ledger_info().timestamp_usecs();
+    let sdk_info = sdk_info_from_user_agent(user_agent);
+
+    let resp = if let Value::Array(requests) = data {
         match service.validate_batch_size_limit(requests.len()) {
             Ok(_) => {
                 // batch API call
                 let futures = requests.into_iter().map(|req| {
-                    rpc_request_handler(
-                        req,
-                        service.clone(),
-                        Arc::clone(&registry),
-                        ledger_info.clone(),
-                        LABEL_BATCH,
-                    )
+                    rpc_request_handler(req, &service, &ledger_info, LABEL_BATCH, sdk_info)
                 });
                 let responses = join_all(futures).await;
-                warp::reply::json(&Value::Array(responses))
+                for resp in &responses {
+                    log_response!(&trace_id, &resp, true);
+                }
+                warp::reply::json(&responses)
             }
             Err(err) => {
-                let mut resp = init_response(&service, &ledger_info);
-                set_response_error(&mut resp, err);
+                let mut response = JsonRpcResponse::new(
+                    chain_id,
+                    latest_ledger_version,
+                    latest_ledger_timestamp_usecs,
+                );
+                response.error = Some(err);
+                bump_counters(&response, LABEL_BATCH, None, sdk_info);
+                log_response!(&trace_id, &response, true);
 
-                warp::reply::json(&resp)
+                warp::reply::json(&response)
             }
         }
     } else {
         // single API call
-        let resp = rpc_request_handler(data, service, registry, ledger_info, LABEL_SINGLE).await;
+        let resp = rpc_request_handler(data, &service, &ledger_info, LABEL_SINGLE, sdk_info).await;
+        log_response!(&trace_id, &resp, false);
+
         warp::reply::json(&resp)
-    });
+    };
 
-    Ok(Box::new(resp) as Box<dyn warp::Reply>)
+    let mut http_response = resp.into_response();
+    let headers = http_response.headers_mut();
+
+    headers.insert(
+        X_DIEM_CHAIN_ID,
+        header::HeaderValue::from_str(&chain_id.id().to_string()).unwrap(),
+    );
+    headers.insert(
+        X_DIEM_VERSION_ID,
+        header::HeaderValue::from_str(&latest_ledger_version.to_string()).unwrap(),
+    );
+    headers.insert(
+        X_DIEM_TIMESTAMP_USEC_ID,
+        header::HeaderValue::from_str(&latest_ledger_timestamp_usecs.to_string()).unwrap(),
+    );
+
+    Ok(http_response)
 }
 
-/// Handler of single RPC request
-/// Performs validation and executes corresponding rpc handler
 async fn rpc_request_handler(
-    req: Value,
-    service: JsonRpcService,
-    registry: Arc<RpcRegistry>,
-    ledger_info: LedgerInfoWithSignatures,
-    request_type_label: &str,
-) -> Value {
-    let request: Map<String, Value>;
-    let mut response = init_response(&service, &ledger_info);
-
-    match req {
-        Value::Object(data) => {
-            request = data;
-        }
-        _ => {
-            set_response_error(&mut response, JsonRpcError::invalid_format());
-            return Value::Object(response);
-        }
-    }
-
-    // parse request id
-    match parse_request_id(&request) {
-        Ok(request_id) => {
-            response.insert("id".to_string(), request_id);
-        }
-        Err(err) => {
-            set_response_error(&mut response, err);
-            return Value::Object(response);
-        }
-    };
-
-    // verify protocol version
-    if let Err(err) = verify_protocol(&request) {
-        set_response_error(&mut response, err);
-        return Value::Object(response);
-    }
-
-    // parse parameters
-    let params;
-    match request.get("params") {
-        Some(Value::Array(parameters)) => {
-            params = parameters.to_vec();
-        }
-        _ => {
-            set_response_error(&mut response, JsonRpcError::invalid_params(None));
-            return Value::Object(response);
-        }
-    }
-
-    let request_params = JsonRpcRequest {
-        ledger_info,
-        params,
-    };
-    // get rpc handler
-    match request.get("method") {
-        Some(Value::String(name)) => match registry.get(name) {
-            Some(handler) => {
-                let timer = counters::METHOD_LATENCY
-                    .with_label_values(&[request_type_label, name])
-                    .start_timer();
-                match handler(service, request_params).await {
-                    Ok(result) => {
-                        response.insert("result".to_string(), result);
-                        counters::REQUESTS
-                            .with_label_values(&[name, LABEL_SUCCESS])
-                            .inc();
-                    }
-                    Err(err) => {
-                        // check for custom error
-                        if let Some(custom_error) = err.downcast_ref::<JsonRpcError>() {
-                            set_response_error(&mut response, custom_error.clone());
-                        } else {
-                            set_response_error(
-                                &mut response,
-                                JsonRpcError::internal_error(err.to_string()),
-                            );
-                        }
-                        counters::REQUESTS
-                            .with_label_values(&[name, LABEL_FAIL])
-                            .inc();
-                    }
-                }
-                timer.stop_and_record();
-            }
-            None => {
-                set_response_error(&mut response, JsonRpcError::method_not_found());
-            }
-        },
-        _ => {
-            set_response_error(&mut response, JsonRpcError::method_not_found());
-        }
-    }
-
-    Value::Object(response)
-}
-
-// Sets the JSON RPC error value for a given response.
-// If a counter label is supplied, also increments the invalid request counter using the label,
-fn set_response_error(response: &mut Map<String, Value>, error: JsonRpcError) {
-    let err_code = error.code;
-    response.insert("error".to_string(), error.serialize());
-
-    if err_code <= -32000 && err_code >= -32099 {
-        counters::INTERNAL_ERRORS.inc();
-    } else {
-        let label = match err_code {
-            -32600 => "invalid_request",
-            -32601 => "method_not_found",
-            -32602 => "invalid_params",
-            -32604 => "invalid_format",
-            -32700 => "parse_error",
-            _ => "unexpected_code",
-        };
-        counters::INVALID_REQUESTS.with_label_values(&[label]).inc();
-    }
-}
-
-fn parse_request_id(request: &Map<String, Value>) -> Result<Value, JsonRpcError> {
-    match request.get("id") {
-        Some(req_id) => {
-            if req_id.is_string() || req_id.is_number() || req_id.is_null() {
-                Ok(req_id.clone())
-            } else {
-                Err(JsonRpcError::invalid_format())
-            }
-        }
-        None => Ok(Value::Null),
-    }
-}
-
-fn verify_protocol(request: &Map<String, Value>) -> Result<(), JsonRpcError> {
-    if let Some(Value::String(protocol)) = request.get("jsonrpc") {
-        if protocol == "2.0" {
-            return Ok(());
-        }
-    }
-    Err(JsonRpcError::invalid_request())
-}
-
-fn init_response(
+    request: Value,
     service: &JsonRpcService,
     ledger_info: &LedgerInfoWithSignatures,
-) -> Map<String, Value> {
-    let mut response = Map::new();
-    let version = ledger_info.ledger_info().version();
-    let timestamp = ledger_info.ledger_info().timestamp_usecs();
+    request_type_label: &str,
+    sdk_info: SdkInfo,
+) -> JsonRpcResponse {
+    let handler = Handler::new(&service, &ledger_info);
 
-    // set defaults: protocol version to 2.0, request id to null
-    response.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
-    response.insert("id".to_string(), Value::Null);
-    response.insert(
-        JSONRPC_LIBRA_LEDGER_VERSION.to_string(),
-        Value::Number(version.into()),
+    let mut response = JsonRpcResponse::new(
+        service.chain_id(),
+        ledger_info.ledger_info().version(),
+        ledger_info.ledger_info().timestamp_usecs(),
     );
-    response.insert(
-        JSONRPC_LIBRA_LEDGER_TIMESTAMPUSECS.to_string(),
-        Value::Number(timestamp.into()),
-    );
-    response.insert(
-        JSONRPC_LIBRA_CHAIN_ID.to_string(),
-        Value::Number(service.chain_id().id().into()),
-    );
+    let method: Option<Method>;
+
+    match diem_json_rpc_types::request::JsonRpcRequest::from_value(request) {
+        Ok(request) => {
+            method = Some(request.method_request.method());
+            let timer = counters::METHOD_LATENCY
+                .with_label_values(&[request_type_label, request.method_request.method().as_str()])
+                .start_timer();
+            response.id = Some(serde_json::to_value(&request.id).unwrap());
+            match handler.handle(request.method_request).await {
+                Ok(ret) => response.result = Some(ret),
+                Err(e) => response.error = Some(e),
+            }
+            timer.stop_and_record();
+        }
+        Err((e, m, id)) => {
+            method = m;
+            response.id = id.map(|id| serde_json::to_value(&id).unwrap());
+            response.error = Some(e);
+        }
+    }
+
+    bump_counters(&response, request_type_label, method, sdk_info);
+
     response
+}
+
+fn bump_counters(
+    response: &JsonRpcResponse,
+    request_type: &str,
+    method: Option<Method>,
+    sdk_info: SdkInfo,
+) {
+    let method_str = method.as_ref().map(|m| m.as_str()).unwrap_or("not_found");
+    let result_label = if let Some(error) = &response.error {
+        if is_internal_error(&error.code) {
+            counters::INTERNAL_ERRORS
+                .with_label_values(&[
+                    request_type,
+                    method_str,
+                    &error.code.to_string(),
+                    sdk_info.language.as_str(),
+                    &sdk_info.version.to_string(),
+                ])
+                .inc();
+        } else {
+            let label = match error.code {
+                -32600 => "invalid_request",
+                -32601 => "method_not_found",
+                -32602 => "invalid_params",
+                -32604 => "invalid_format",
+                _ => "unexpected_code",
+            };
+            counters::INVALID_REQUESTS
+                .with_label_values(&[
+                    request_type,
+                    method_str,
+                    label,
+                    sdk_info.language.as_str(),
+                    &sdk_info.version.to_string(),
+                ])
+                .inc();
+        }
+        LABEL_FAIL
+    } else {
+        LABEL_SUCCESS
+    };
+
+    if method.is_some() {
+        counters::REQUESTS
+            .with_label_values(&[
+                request_type,
+                method_str,
+                result_label,
+                sdk_info.language.as_str(),
+                &sdk_info.version.to_string(),
+            ])
+            .inc();
+    }
 }
 
 /// Warp rejection types
@@ -344,3 +438,7 @@ fn init_response(
 struct DatabaseError;
 
 impl Reject for DatabaseError {}
+
+#[derive(Debug)]
+struct HealthCheckError;
+impl warp::reject::Reject for HealthCheckError {}

@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines the abstract state for the type and memory safety analysis.
@@ -7,16 +7,16 @@ use crate::{
     binary_views::FunctionView,
 };
 use borrow_graph::references::RefID;
-use libra_types::vm_status::StatusCode;
 use mirai_annotations::{checked_postcondition, checked_precondition, checked_verify};
-use std::collections::{BTreeMap, BTreeSet};
-use vm::{
+use move_binary_format::{
     errors::{PartialVMError, PartialVMResult},
     file_format::{
         CodeOffset, FieldHandleIndex, FunctionDefinitionIndex, LocalIndex, Signature,
         SignatureToken, StructDefinitionIndex,
     },
 };
+use move_core_types::vm_status::StatusCode;
+use std::collections::{BTreeMap, BTreeSet};
 
 type BorrowGraph = borrow_graph::graph::BorrowGraph<(), Label>;
 
@@ -98,7 +98,10 @@ impl AbstractState {
 
         for (param_idx, param_ty) in function_view.parameters().0.iter().enumerate() {
             let value = if param_ty.is_reference() {
-                let id = state.new_ref(param_ty.is_mutable_reference());
+                let id = RefID::new(param_idx);
+                state
+                    .borrow_graph
+                    .new_ref(id, param_ty.is_mutable_reference());
                 AbstractValue::Reference(id)
             } else {
                 AbstractValue::NonReference
@@ -106,6 +109,8 @@ impl AbstractState {
             state.locals.insert(param_idx as LocalIndex, value);
         }
         state.borrow_graph.new_ref(state.frame_root(), true);
+
+        checked_verify!(state.is_canonical());
         state
     }
 
@@ -640,8 +645,8 @@ impl AbstractState {
             current_function,
             locals,
             borrow_graph,
-            next_id,
             num_locals,
+            next_id,
         }
     }
 }
@@ -650,6 +655,7 @@ impl AbstractDomain for AbstractState {
     /// attempts to join state to self and returns the result
     fn join(&mut self, state: &AbstractState) -> JoinResult {
         let joined = Self::join_(self, state);
+        checked_verify!(joined.is_canonical());
         checked_verify!(self.num_locals == joined.num_locals);
         let locals_unchanged = self
             .iter_locals()

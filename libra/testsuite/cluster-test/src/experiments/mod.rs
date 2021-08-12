@@ -1,17 +1,20 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-mod client_compatibility_test;
+mod accurate_measurment;
 mod compatibility_test;
 mod cpu_flamegraph;
+mod load_test;
 mod packet_loss_random_validators;
 mod performance_benchmark;
 mod performance_benchmark_three_region_simulation;
 mod reboot_cluster;
 mod reboot_random_validators;
+mod reconfiguration_test;
 mod recovery_time;
+mod state_sync_performance;
 mod twin_validator;
 mod versioning_test;
 
@@ -21,8 +24,8 @@ use std::{
     time::Duration,
 };
 
-pub use client_compatibility_test::{ClientCompatibilityTest, ClientCompatiblityTestParams};
 pub use compatibility_test::{CompatibilityTest, CompatiblityTestParams};
+pub use load_test::LoadTestParams;
 pub use packet_loss_random_validators::{
     PacketLossRandomValidators, PacketLossRandomValidatorsParams,
 };
@@ -32,7 +35,9 @@ pub use performance_benchmark_three_region_simulation::{
 };
 pub use reboot_cluster::{RebootCluster, RebootClusterParams};
 pub use reboot_random_validators::{RebootRandomValidators, RebootRandomValidatorsParams};
+pub use reconfiguration_test::{Reconfiguration, ReconfigurationParams};
 pub use recovery_time::{RecoveryTime, RecoveryTimeParams};
+pub use state_sync_performance::{StateSyncPerformance, StateSyncPerformanceParams};
 pub use twin_validator::{TwinValidators, TwinValidatorsParams};
 pub use versioning_test::{ValidatorVersioning, ValidatorVersioningParams};
 
@@ -46,7 +51,7 @@ use crate::{
 
 use crate::{
     cluster_swarm::{cluster_swarm_kube::ClusterSwarmKube, ClusterSwarm},
-    health::TraceTail,
+    experiments::accurate_measurment::AccurateMeasurementParams,
 };
 use async_trait::async_trait;
 pub use cpu_flamegraph::{CpuFlamegraph, CpuFlamegraphParams};
@@ -68,7 +73,6 @@ pub trait ExperimentParam {
 
 pub struct Context<'a> {
     pub tx_emitter: &'a mut TxEmitter,
-    pub trace_tail: &'a mut TraceTail,
     pub prometheus: &'a Prometheus,
     pub cluster_builder: &'a mut ClusterBuilder,
     pub cluster_builder_params: &'a ClusterBuilderParams,
@@ -84,7 +88,6 @@ pub struct Context<'a> {
 impl<'a> Context<'a> {
     pub fn new(
         tx_emitter: &'a mut TxEmitter,
-        trace_tail: &'a mut TraceTail,
         prometheus: &'a Prometheus,
         cluster_builder: &'a mut ClusterBuilder,
         cluster_builder_params: &'a ClusterBuilderParams,
@@ -97,7 +100,6 @@ impl<'a> Context<'a> {
     ) -> Self {
         Context {
             tx_emitter,
-            trace_tail,
             prometheus,
             cluster_builder,
             cluster_builder_params,
@@ -151,11 +153,11 @@ pub fn get_experiment(name: &str, args: &[String], cluster: &Cluster) -> Box<dyn
     known_experiments.insert("generate_cpu_flamegraph", f::<CpuFlamegraphParams>());
     known_experiments.insert("versioning_testing", f::<ValidatorVersioningParams>());
     known_experiments.insert("compatibility_test", f::<CompatiblityTestParams>());
-    known_experiments.insert(
-        "client_compatibility_test",
-        f::<ClientCompatiblityTestParams>(),
-    );
     known_experiments.insert("reboot_cluster", f::<RebootClusterParams>());
+    known_experiments.insert("reconfiguration", f::<ReconfigurationParams>());
+    known_experiments.insert("load_test", f::<LoadTestParams>());
+    known_experiments.insert("state_sync_performance", f::<StateSyncPerformanceParams>());
+    known_experiments.insert("measure", f::<AccurateMeasurementParams>());
 
     let builder = known_experiments.get(name).expect("Experiment not found");
     builder(args, cluster)

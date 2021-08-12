@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Result};
-use libra_types::transaction::Version;
+use diem_logger::prelude::*;
+use diem_types::transaction::Version;
 use once_cell::sync::Lazy;
 use std::{convert::TryInto, str::FromStr, sync::Arc};
 use structopt::StructOpt;
@@ -51,7 +52,7 @@ impl TransactionBackupController {
     }
 
     pub async fn run(self) -> Result<FileHandle> {
-        println!(
+        info!(
             "Transaction backup started, starting from version {}, for {} transactions in total.",
             self.start_version, self.num_transactions,
         );
@@ -59,7 +60,7 @@ impl TransactionBackupController {
             .run_impl()
             .await
             .map_err(|e| anyhow!("Transaction backup failed: {}", e))?;
-        println!("Transaction backup succeeded. Manifest: {}", ret);
+        info!("Transaction backup succeeded. Manifest: {}", ret);
         Ok(ret)
     }
 }

@@ -1,7 +1,7 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_log_derive::Schema;
+use diem_log_derive::Schema;
 
 #[test]
 fn simple() {
@@ -16,7 +16,7 @@ fn simple() {
         optional: None,
     };
 
-    t.required(1).optional(2).into_struct_log();
+    t.required(1).optional(2);
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn lifetime() {
 
     let t = Test::default();
 
-    t.s("foo").into_struct_log();
+    t.s("foo");
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn generic() {
 
     let t = Test::default();
 
-    t.s(5).into_struct_log();
+    t.s(5);
 }
 
 #[test]
@@ -55,5 +55,37 @@ fn attrs() {
 
     let t = Test::default();
 
-    t.debug(vec![1, 2, 3]).display(4).into_struct_log();
+    t.debug(vec![1, 2, 3]).display(4);
+}
+
+#[test]
+fn error_trait_object() {
+    use std::fmt;
+
+    #[derive(Default, Schema)]
+    pub struct Test<'a> {
+        #[schema(debug)]
+        debug_error: Option<&'a dyn ::std::error::Error>,
+        #[schema(display)]
+        display_error: Option<&'a dyn ::std::error::Error>,
+    }
+
+    #[derive(Debug)]
+    struct OurError;
+
+    impl fmt::Display for OurError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Custom Error")
+        }
+    }
+
+    impl ::std::error::Error for OurError {}
+
+    let debug_error = ::std::io::Error::new(::std::io::ErrorKind::Other, "This is an error");
+    let display_error = OurError;
+    let t = Test::default()
+        .debug_error(&debug_error)
+        .display_error(&display_error);
+
+    ::diem_logger::info!(t);
 }

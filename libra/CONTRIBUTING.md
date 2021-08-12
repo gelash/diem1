@@ -1,24 +1,27 @@
-# Contributing to Libra
+---
+id: contributing
+title: Contributing to Diem
+---
 
-Our goal is to make contributing to the Libra project easy and transparent.
+Our goal is to make contributing to the Diem project easy and transparent.
 
-> **Note**: As the Libra Core project is currently an early-stage prototype, it
+> **Note**: As the Diem Core project is currently an early-stage prototype, it
 > is undergoing rapid development. While we welcome contributions, before
 > making substantial contributions be sure to discuss them in the Discourse
 > forum to ensure that they fit into the project roadmap.
 
 ## On Contributing
 
-### Libra Core
+### Diem Core
 
-To contribute to the Libra Core implementation, first start with the proper
+To contribute to the Diem Core implementation, first start with the proper
 development copy.
 
 To get the development installation with all the necessary dependencies for
 linting, testing, and building the documentation, run the following:
 ```bash
-git clone https://github.com/libra/libra.git
-cd libra
+git clone https://github.com/diem/diem.git
+cd diem
 ./scripts/dev_setup.sh
 cargo build
 cargo xtest
@@ -29,24 +32,24 @@ cargo xtest
 #### Code Style, Hints, and Testing
 
 Refer to our [Coding
-Guidelines](https://developers.libra.org/docs/community/coding-guidelines) for
+Guidelines](https://github.com/diem/diem/blob/main/documentation/coding_guidelines.md) for
 detailed guidance about how to contribute to the project.
 
 #### Documentation
 
-Libra's website is also open source (the code can be found in this
-[repository](https://github.com/libra/website/)).  It is built using
+Diem's developer website is also open source (the code can be found in this
+[repository](https://github.com/diem/diem/developers.diem.com/website/)).  It is built using
 [Docusaurus](https://docusaurus.io/):
 
-If you know Markdown, you can already contribute! This lives in the [website
-repo](https://github.com/libra/website).
+If you know Markdown, you can already contribute! How to contribute can be found in the [website
+repo](https://github.com/diem/developers.diem.com/website/CONTRIBUTING.md).
 
 ## Developer Workflow
 
 Changes to the project are proposed through pull requests. The general pull
 request workflow is as follows:
 
-1. Fork the repo and create a topic branch off of `master`.
+1. Fork the repo and create a topic branch off of `main`.
 2. If you have added code that should be tested, add unit tests.
 3. If you have changed APIs, update the documentation. Make sure the
    documentation builds.
@@ -137,17 +140,17 @@ separate commits on top of your PR unless it logically makes sense to have
 separate, distinct commits for those changes. This helps keep the commit
 history clean.
 
-If your pull request is out-of-date and needs to be updated because `master`
-has advanced, you should rebase your branch on top of the latest master by
+If your pull request is out-of-date and needs to be updated because `main`
+has advanced, you should rebase your branch on top of the latest main by
 doing the following:
 
 ```bash
 git fetch upstream
 git checkout topic
-git rebase -i upstream/master
+git rebase -i upstream/main
 ```
 
-You *should not* update your branch by merging the latest master into your
+You *should not* update your branch by merging the latest main into your
 branch. Merge commits included in PRs tend to make it more difficult for the
 reviewer to understand the change being made, especially if the merge wasn't
 clean and needed conflicts to be resolved. As such, PRs with merge commits will
@@ -164,16 +167,16 @@ able to be built and passes all checks performed by CI.
 
 ## Contributor License Agreement
 
-For pull request to be accepted by any Libra projects, a CLA must be signed.
-You will only need to do this once to work on any of Libra's open source
+For pull request to be accepted by any Diem projects, a CLA must be signed.
+You will only need to do this once to work on any of Diem's open source
 projects. Individuals contributing on their own behalf can sign the [Individual
-CLA](https://github.com/libra/libra/blob/master/contributing/individual-cla.pdf).
+CLA](https://github.com/diem/diem/blob/main/documentation/contributing/individual-cla.pdf).
 If you are contributing on behalf of your employer, please ask them to sign the
 [Corporate
-CLA](https://github.com/libra/libra/blob/master/contributing/corporate-cla.pdf).
+CLA](https://github.com/diem/diem/blob/main/documentation/contributing/corporate-cla.pdf).
 
 ## Issues
 
-Libra uses [GitHub issues](https://github.com/libra/libra/issues) to track
+Diem uses [GitHub issues](https://github.com/diem/diem/issues) to track
 bugs. Please include necessary information and instructions to reproduce your
 issue.

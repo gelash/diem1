@@ -1,21 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use libra_crypto::ed25519::Ed25519PublicKey;
-use libra_management::{error::Error, execute_command};
-use libra_types::{transaction::Transaction, waypoint::Waypoint};
+use diem_crypto::ed25519::Ed25519PublicKey;
+use diem_management::{error::Error, execute_command};
+use diem_types::{transaction::Transaction, waypoint::Waypoint};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
 #[structopt(about = "Tool used for genesis")]
 pub enum Command {
-    #[structopt(about = "Create a waypoint and place it in a store")]
-    CreateAndInsertWaypoint(crate::waypoint::CreateAndInsertWaypoint),
     #[structopt(about = "Create a waypoint")]
     CreateWaypoint(crate::waypoint::CreateWaypoint),
     #[structopt(about = "Retrieves data from a store to produce genesis")]
     Genesis(crate::genesis::Genesis),
-    #[structopt(about = "Submits an Ed25519PublicKey for the libra root")]
-    LibraRootKey(crate::key::LibraRootKey),
+    #[structopt(about = "Set the waypoint in the validator storage")]
+    InsertWaypoint(diem_management::waypoint::InsertWaypoint),
+    #[structopt(about = "Submits an Ed25519PublicKey for the diem root")]
+    DiemRootKey(crate::key::DiemRootKey),
     #[structopt(about = "Submits an Ed25519PublicKey for the operator")]
     OperatorKey(crate::key::OperatorKey),
     #[structopt(about = "Submits an Ed25519PublicKey for the owner")]
@@ -24,6 +24,8 @@ pub enum Command {
     SetLayout(crate::layout::SetLayout),
     #[structopt(about = "Sets the validator operator chosen by the owner")]
     SetOperator(crate::validator_operator::ValidatorOperator),
+    #[structopt(about = "Submits an Ed25519PublicKey for the treasury root")]
+    TreasuryComplianceKey(crate::key::TreasuryComplianceKey),
     #[structopt(about = "Constructs and signs a ValidatorConfig")]
     ValidatorConfig(crate::validator_config::ValidatorConfig),
     #[structopt(about = "Verifies and prints the current configuration state")]
@@ -32,14 +34,15 @@ pub enum Command {
 
 #[derive(Debug, PartialEq)]
 pub enum CommandName {
-    CreateAndInsertWaypoint,
     CreateWaypoint,
     Genesis,
-    LibraRootKey,
+    InsertWaypoint,
+    DiemRootKey,
     OperatorKey,
     OwnerKey,
     SetLayout,
     SetOperator,
+    TreasuryComplianceKey,
     ValidatorConfig,
     Verify,
 }
@@ -47,14 +50,15 @@ pub enum CommandName {
 impl From<&Command> for CommandName {
     fn from(command: &Command) -> Self {
         match command {
-            Command::CreateAndInsertWaypoint(_) => CommandName::CreateAndInsertWaypoint,
             Command::CreateWaypoint(_) => CommandName::CreateWaypoint,
             Command::Genesis(_) => CommandName::Genesis,
-            Command::LibraRootKey(_) => CommandName::LibraRootKey,
+            Command::InsertWaypoint(_) => CommandName::InsertWaypoint,
+            Command::DiemRootKey(_) => CommandName::DiemRootKey,
             Command::OperatorKey(_) => CommandName::OperatorKey,
             Command::OwnerKey(_) => CommandName::OwnerKey,
             Command::SetLayout(_) => CommandName::SetLayout,
             Command::SetOperator(_) => CommandName::SetOperator,
+            Command::TreasuryComplianceKey(_) => CommandName::TreasuryComplianceKey,
             Command::ValidatorConfig(_) => CommandName::ValidatorConfig,
             Command::Verify(_) => CommandName::Verify,
         }
@@ -64,14 +68,15 @@ impl From<&Command> for CommandName {
 impl std::fmt::Display for CommandName {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let name = match self {
-            CommandName::CreateAndInsertWaypoint => "create-and-insert-waypoint",
             CommandName::CreateWaypoint => "create-waypoint",
             CommandName::Genesis => "genesis",
-            CommandName::LibraRootKey => "libra-root-key",
+            CommandName::InsertWaypoint => "insert-waypoint",
+            CommandName::DiemRootKey => "diem-root-key",
             CommandName::OperatorKey => "operator-key",
             CommandName::OwnerKey => "owner-key",
             CommandName::SetLayout => "set-layout",
             CommandName::SetOperator => "set-operator",
+            CommandName::TreasuryComplianceKey => "treasury-compliance-key",
             CommandName::ValidatorConfig => "validator-config",
             CommandName::Verify => "verify",
         };
@@ -80,29 +85,24 @@ impl std::fmt::Display for CommandName {
 }
 
 impl Command {
-    pub fn execute(self) -> String {
+    pub fn execute(self) -> Result<String, Error> {
         match &self {
-            Command::CreateAndInsertWaypoint(_) => {
-                self.create_and_insert_waypoint().unwrap().to_string()
+            Command::CreateWaypoint(_) => {
+                self.create_waypoint().map(|w| format!("Waypoint: {}", w))
             }
-            Command::CreateWaypoint(_) => self.create_waypoint().unwrap().to_string(),
-            Command::Genesis(_) => format!("{:?}", self.genesis().unwrap()),
-            Command::LibraRootKey(_) => self.libra_root_key().unwrap().to_string(),
-            Command::OperatorKey(_) => self.operator_key().unwrap().to_string(),
-            Command::OwnerKey(_) => self.owner_key().unwrap().to_string(),
-            Command::SetLayout(_) => self.set_layout().unwrap().to_string(),
-            Command::SetOperator(_) => format!("{:?}", self.set_operator().unwrap()),
-            Command::ValidatorConfig(_) => format!("{:?}", self.validator_config().unwrap()),
-            Command::Verify(_) => self.verify().unwrap(),
+            Command::Genesis(_) => self.genesis().map(|_| "Success!".to_string()),
+            Command::InsertWaypoint(_) => self.insert_waypoint().map(|_| "Success!".to_string()),
+            Command::DiemRootKey(_) => self.diem_root_key().map(|_| "Success!".to_string()),
+            Command::OperatorKey(_) => self.operator_key().map(|_| "Success!".to_string()),
+            Command::OwnerKey(_) => self.owner_key().map(|_| "Success!".to_string()),
+            Command::SetLayout(_) => self.set_layout().map(|_| "Success!".to_string()),
+            Command::SetOperator(_) => self.set_operator().map(|_| "Success!".to_string()),
+            Command::TreasuryComplianceKey(_) => self
+                .treasury_compliance_key()
+                .map(|_| "Success!".to_string()),
+            Command::ValidatorConfig(_) => self.validator_config().map(|_| "Success!".to_string()),
+            Command::Verify(_) => self.verify(),
         }
-    }
-
-    pub fn create_and_insert_waypoint(self) -> Result<Waypoint, Error> {
-        execute_command!(
-            self,
-            Command::CreateAndInsertWaypoint,
-            CommandName::CreateAndInsertWaypoint
-        )
     }
 
     pub fn create_waypoint(self) -> Result<Waypoint, Error> {
@@ -113,8 +113,12 @@ impl Command {
         execute_command!(self, Command::Genesis, CommandName::Genesis)
     }
 
-    pub fn libra_root_key(self) -> Result<Ed25519PublicKey, Error> {
-        execute_command!(self, Command::LibraRootKey, CommandName::LibraRootKey)
+    pub fn insert_waypoint(self) -> Result<(), Error> {
+        execute_command!(self, Command::InsertWaypoint, CommandName::InsertWaypoint)
+    }
+
+    pub fn diem_root_key(self) -> Result<Ed25519PublicKey, Error> {
+        execute_command!(self, Command::DiemRootKey, CommandName::DiemRootKey)
     }
 
     pub fn operator_key(self) -> Result<Ed25519PublicKey, Error> {
@@ -131,6 +135,14 @@ impl Command {
 
     pub fn set_operator(self) -> Result<String, Error> {
         execute_command!(self, Command::SetOperator, CommandName::SetOperator)
+    }
+
+    pub fn treasury_compliance_key(self) -> Result<Ed25519PublicKey, Error> {
+        execute_command!(
+            self,
+            Command::TreasuryComplianceKey,
+            CommandName::TreasuryComplianceKey
+        )
     }
 
     pub fn validator_config(self) -> Result<Transaction, Error> {
@@ -151,15 +163,11 @@ impl Command {
 pub mod tests {
     use super::*;
     use crate::storage_helper::StorageHelper;
-    use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-    use libra_global_constants::{OPERATOR_KEY, OWNER_KEY};
-    use libra_management::constants;
-    use libra_secure_storage::KVStorage;
-    use libra_types::{
-        account_address,
-        chain_id::ChainId,
-        transaction::{TransactionArgument, TransactionPayload},
-    };
+    use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
+    use diem_global_constants::{OPERATOR_KEY, OWNER_KEY};
+    use diem_management::constants;
+    use diem_secure_storage::KVStorage;
+    use diem_types::{account_address, chain_id::ChainId, transaction::TransactionPayload};
     use std::{
         fs::File,
         io::{Read, Write},
@@ -172,7 +180,7 @@ pub mod tests {
         // Each identity works in their own namespace
         // Alice, Bob, and Carol are owners.
         // Operator_Alice, Operator_Bob and Operator_Carol are operators.
-        // Dave is the libra root.
+        // Dave is the diem root.
         // Each user will upload their contents to *_ns + "shared"
         // Common is used by the technical staff for coordination.
         let alice_ns = "alice";
@@ -183,16 +191,18 @@ pub mod tests {
         let operator_carol_ns = "operator_carol";
         let dave_ns = "dave";
         let shared = "_shared";
+        let mut storage_idx = 0;
 
         // Step 1) Define and upload the layout specifying which identities have which roles. This
         // is uploaded to the common namespace:
         let layout_text = "\
             operators = [\"operator_alice_shared\", \"operator_bob_shared\", \"operator_carol_shared\"]\n\
             owners = [\"alice_shared\", \"bob_shared\", \"carol_shared\"]\n\
-            libra_root = [\"dave_shared\"]\n\
+            diem_root = \"dave_shared\"\n\
+            treasury_compliance = \"dave_shared\"\n\
         ";
 
-        let temppath = libra_temppath::TempPath::new();
+        let temppath = diem_temppath::TempPath::new();
         temppath.create_as_file().unwrap();
         let mut file = File::create(temppath.path()).unwrap();
         file.write_all(&layout_text.to_string().into_bytes())
@@ -200,22 +210,28 @@ pub mod tests {
         file.sync_all().unwrap();
 
         helper
-            .set_layout(temppath.path().to_str().unwrap(), constants::COMMON_NS)
+            .set_layout(temppath.path().to_str().unwrap())
             .unwrap();
 
-        // Step 2) Upload the libra root key:
-        helper.initialize(dave_ns.into());
+        // Step 2) Upload the root keys:
+        helper.initialize_by_idx(dave_ns.into(), storage_idx);
         helper
-            .libra_root_key(dave_ns, &(dave_ns.to_string() + shared))
+            .diem_root_key(dave_ns, &(dave_ns.to_string() + shared))
+            .unwrap();
+        helper
+            .treasury_compliance_key(dave_ns, &(dave_ns.to_string() + shared))
             .unwrap();
 
-        // Step 3) Upload each owner key:
+        // Step 3) Upload each owner key (except carol, she'll have auth_key [0; 32]):
         for ns in [alice_ns, bob_ns, carol_ns].iter() {
             let ns = (*ns).to_string();
             let ns_shared = (*ns).to_string() + shared;
 
-            helper.initialize(ns.clone());
-            helper.owner_key(&ns, &ns_shared).unwrap();
+            storage_idx += 1;
+            helper.initialize_by_idx(ns.clone(), storage_idx);
+            if ns != carol_ns {
+                helper.owner_key(&ns, &ns_shared).unwrap();
+            }
         }
 
         // Step 4) Upload each operator key:
@@ -223,7 +239,8 @@ pub mod tests {
             let ns = (*ns).to_string();
             let ns_shared = (*ns).to_string() + shared;
 
-            helper.initialize(ns.clone());
+            storage_idx += 1;
+            helper.initialize_by_idx(ns.clone(), storage_idx);
             helper.operator_key(&ns, &ns_shared).unwrap();
         }
 
@@ -255,7 +272,7 @@ pub mod tests {
         }
 
         // Step 7) Produce genesis
-        let genesis_path = libra_temppath::TempPath::new();
+        let genesis_path = diem_temppath::TempPath::new();
         genesis_path.create_as_file().unwrap();
         helper
             .genesis(ChainId::test(), genesis_path.path())
@@ -268,9 +285,8 @@ pub mod tests {
 
         // Step 9) Verify
         for ns in [operator_alice_ns, operator_bob_ns, operator_carol_ns].iter() {
-            helper
-                .create_and_insert_waypoint(ChainId::test(), ns)
-                .unwrap();
+            let waypoint = helper.create_waypoint(ChainId::test()).unwrap();
+            helper.insert_waypoint(ns, waypoint).unwrap();
             helper.verify_genesis(ns, genesis_path.path()).unwrap();
         }
     }
@@ -278,11 +294,10 @@ pub mod tests {
     #[test]
     fn test_set_layout() {
         let helper = StorageHelper::new();
-        let namespace = "set_layout";
 
-        let temppath = libra_temppath::TempPath::new();
+        let temppath = diem_temppath::TempPath::new();
         helper
-            .set_layout(temppath.path().to_str().unwrap(), namespace)
+            .set_layout(temppath.path().to_str().unwrap())
             .unwrap_err();
 
         temppath.create_as_file().unwrap();
@@ -290,26 +305,29 @@ pub mod tests {
         let layout_text = "\
             operators = [\"alice\", \"bob\"]\n\
             owners = [\"carol\"]\n\
-            libra_root = [\"dave\"]\n\
+            diem_root = \"dave\"\n\
+            treasury_compliance = \"other_dave\"\n\
         ";
         file.write_all(&layout_text.to_string().into_bytes())
             .unwrap();
         file.sync_all().unwrap();
 
         helper
-            .set_layout(temppath.path().to_str().unwrap(), namespace)
+            .set_layout(temppath.path().to_str().unwrap())
             .unwrap();
-        let storage = helper.storage(namespace.into());
+        let storage = helper.storage(constants::COMMON_NS.into());
         let stored_layout = storage.get::<String>(constants::LAYOUT).unwrap().value;
         assert_eq!(layout_text, stored_layout);
     }
 
     #[test]
     fn test_validator_config() {
+        use diem_types::account_address::AccountAddress;
+
         let storage_helper = StorageHelper::new();
         let local_operator_ns = "local";
         let remote_operator_ns = "operator";
-        storage_helper.initialize(local_operator_ns.into());
+        storage_helper.initialize_by_idx(local_operator_ns.into(), 0);
 
         // Operator uploads key to shared storage and initializes address in local storage
         let operator_key = storage_helper
@@ -319,7 +337,8 @@ pub mod tests {
         // Upload an owner key to the remote storage
         let owner_name = "owner";
         let owner_key = Ed25519PrivateKey::generate_for_testing().public_key();
-        let owner_account = account_address::from_public_key(&owner_key);
+        let owner_account =
+            diem_config::utils::validator_owner_account_from_name(owner_name.as_bytes());
         let mut shared_storage = storage_helper.storage(owner_name.into());
         shared_storage
             .set(OWNER_KEY, owner_key)
@@ -353,15 +372,15 @@ pub mod tests {
 
         // Verify the validator config in the transaction has the correct account address
         match uploaded_user_transaction.payload() {
-            TransactionPayload::Script(script) => {
-                assert_eq!(4, script.args().len());
+            TransactionPayload::ScriptFunction(script_function) => {
+                assert_eq!(4, script_function.args().len());
 
-                match script.args().get(0).unwrap() {
-                    TransactionArgument::Address(account_address) => {
-                        assert_eq!(&owner_account, account_address);
+                match bcs::from_bytes::<AccountAddress>(script_function.args().get(0).unwrap()) {
+                    Ok(account_address) => {
+                        assert_eq!(owner_account, account_address);
                     }
                     _ => panic!(
-                        "Found an invalid argument type for the validator-config transaction script!"
+                        "Found an invalid argument type for the validator-config transaction script function!"
                     ),
                 };
             }
@@ -374,7 +393,7 @@ pub mod tests {
         let storage_helper = StorageHelper::new();
         let local_owner_ns = "local";
         let remote_owner_ns = "owner";
-        storage_helper.initialize(local_owner_ns.into());
+        storage_helper.initialize_by_idx(local_owner_ns.into(), 0);
 
         // Upload an operator key to the remote storage
         let operator_name = "operator";
@@ -412,7 +431,7 @@ pub mod tests {
         // 9 KeyNotSet results in 10 splits
         assert_eq!(output, 10);
 
-        helper.initialize(namespace.into());
+        helper.initialize_by_idx(namespace.into(), 0);
 
         let output = helper
             .verify(namespace)

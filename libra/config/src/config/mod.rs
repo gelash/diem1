@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use rand::{rngs::StdRng, SeedableRng};
@@ -31,8 +31,8 @@ mod mempool_config;
 pub use mempool_config::*;
 mod network_config;
 pub use network_config::*;
-mod rpc_config;
-pub use rpc_config::*;
+mod json_rpc_config;
+pub use json_rpc_config::*;
 mod secure_backend_config;
 pub use secure_backend_config::*;
 mod state_sync_config;
@@ -45,8 +45,8 @@ mod upstream_config;
 pub use upstream_config::*;
 mod test_config;
 use crate::network_id::NetworkId;
-use libra_secure_storage::{KVStorage, Storage};
-use libra_types::waypoint::Waypoint;
+use diem_secure_storage::{KVStorage, Storage};
+use diem_types::waypoint::Waypoint;
 pub use test_config::*;
 
 /// Config pulls in configuration information from the config file.
@@ -73,15 +73,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub mempool: MempoolConfig,
     #[serde(default)]
-    pub rpc: RpcConfig,
+    pub json_rpc: JsonRpcConfig,
     #[serde(default)]
     pub state_sync: StateSyncConfig,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub test: Option<TestConfig>,
-    #[serde(default)]
-    pub upstream: UpstreamConfig,
     #[serde(default)]
     pub validator_network: Option<NetworkConfig>,
     #[serde(default)]
@@ -99,7 +97,7 @@ pub struct BaseConfig {
 impl Default for BaseConfig {
     fn default() -> BaseConfig {
         BaseConfig {
-            data_dir: PathBuf::from("/opt/libra/data"),
+            data_dir: PathBuf::from("/opt/diem/data"),
             role: RoleType::Validator,
             waypoint: WaypointConfig::None,
         }
@@ -138,7 +136,7 @@ impl WaypointConfig {
             WaypointConfig::FromStorage(backend) => {
                 let storage: Storage = backend.into();
                 let waypoint = storage
-                    .get::<Waypoint>(libra_global_constants::WAYPOINT)
+                    .get::<Waypoint>(diem_global_constants::WAYPOINT)
                     .expect("Unable to read waypoint")
                     .value;
                 Some(waypoint)
@@ -146,6 +144,19 @@ impl WaypointConfig {
             WaypointConfig::None => None,
         };
         waypoint.expect("waypoint should be present")
+    }
+
+    pub fn genesis_waypoint(&self) -> Waypoint {
+        match &self {
+            WaypointConfig::FromStorage(backend) => {
+                let storage: Storage = backend.into();
+                storage
+                    .get::<Waypoint>(diem_global_constants::GENESIS_WAYPOINT)
+                    .expect("Unable to read waypoint")
+                    .value
+            }
+            _ => self.waypoint(),
+        }
     }
 }
 
@@ -198,7 +209,7 @@ impl fmt::Display for RoleType {
 pub struct ParseRoleError(String);
 
 impl NodeConfig {
-    pub fn data_dir(&self) -> &PathBuf {
+    pub fn data_dir(&self) -> &Path {
         &self.base.data_dir
     }
 
@@ -215,27 +226,37 @@ impl NodeConfig {
     /// Paths used in the config are either absolute or relative to the config location
     pub fn load<P: AsRef<Path>>(input_path: P) -> Result<Self, Error> {
         let mut config = Self::load_config(&input_path)?;
-        if config.base.role.is_validator() {
+
+        let input_dir = RootPath::new(input_path);
+        config.execution.load(&input_dir)?;
+
+        let mut config = config.validate_network_configs()?;
+        config.set_data_dir(config.data_dir().to_path_buf());
+        Ok(config)
+    }
+
+    /// Checks `NetworkConfig` setups so that they exist on proper networks
+    /// Additionally, handles any strange missing default cases
+    fn validate_network_configs(mut self) -> Result<NodeConfig, Error> {
+        if self.base.role.is_validator() {
             invariant(
-                config.validator_network.is_some(),
+                self.validator_network.is_some(),
                 "Missing a validator network config for a validator node".into(),
             )?;
         } else {
             invariant(
-                config.validator_network.is_none(),
+                self.validator_network.is_none(),
                 "Provided a validator network config for a full_node node".into(),
             )?;
         }
 
         let mut network_ids = HashSet::new();
-        let input_dir = RootPath::new(input_path);
-        config.execution.load(&input_dir)?;
-        if let Some(network) = &mut config.validator_network {
-            network.load(RoleType::Validator)?;
+        if let Some(network) = &mut self.validator_network {
+            network.load_validator_network()?;
             network_ids.insert(network.network_id.clone());
         }
-        for network in &mut config.full_node_networks {
-            network.load(RoleType::FullNode)?;
+        for network in &mut self.full_node_networks {
+            network.load_fullnode_network()?;
 
             // Check a validator network is not included in a list of full-node networks
             let network_id = &network.network_id;
@@ -245,8 +266,7 @@ impl NodeConfig {
             )?;
             network_ids.insert(network_id.clone());
         }
-        config.set_data_dir(config.data_dir().clone());
-        Ok(config)
+        Ok(self)
     }
 
     pub fn save<P: AsRef<Path>>(&mut self, output_path: P) -> Result<(), Error> {
@@ -259,49 +279,36 @@ impl NodeConfig {
 
     pub fn randomize_ports(&mut self) {
         self.debug_interface.randomize_ports();
-        self.rpc.randomize_ports();
+        self.json_rpc.randomize_ports();
         self.storage.randomize_ports();
 
         if let Some(network) = self.validator_network.as_mut() {
             network.listen_address = crate::utils::get_available_port_in_multiaddr(true);
-            if let DiscoveryMethod::Gossip(config) = &mut network.discovery_method {
-                config.advertised_address = network.listen_address.clone();
-            }
         }
 
         for network in self.full_node_networks.iter_mut() {
             network.listen_address = crate::utils::get_available_port_in_multiaddr(true);
-            if let DiscoveryMethod::Gossip(config) = &mut network.discovery_method {
-                config.advertised_address = network.listen_address.clone();
-            }
         }
     }
 
     pub fn random() -> Self {
         let mut rng = StdRng::from_seed([0u8; 32]);
-        Self::random_with_rng(&mut rng)
+        Self::random_with_template(0, &NodeConfig::default(), &mut rng)
     }
 
-    pub fn random_with_rng(rng: &mut StdRng) -> Self {
-        let mut config = NodeConfig::default();
-        config.random_internal(rng);
-        config
-    }
-
-    pub fn random_with_template(template: &Self, rng: &mut StdRng) -> Self {
+    pub fn random_with_template(idx: u32, template: &Self, rng: &mut StdRng) -> Self {
         let mut config = template.clone();
-        config.random_internal(rng);
+        config.random_internal(idx, rng);
         config
     }
 
-    fn random_internal(&mut self, rng: &mut StdRng) {
-        let mut test = TestConfig::new_with_temp_dir();
+    fn random_internal(&mut self, idx: u32, rng: &mut StdRng) {
+        let mut test = TestConfig::new_with_temp_dir(None);
 
         if self.base.role == RoleType::Validator {
             test.random_account_key(rng);
-            let peer_id = libra_types::account_address::from_public_key(
-                &test.owner_key.as_ref().unwrap().public_key(),
-            );
+            let peer_id =
+                crate::utils::validator_owner_account_from_name(idx.to_string().as_bytes());
 
             if self.validator_network.is_none() {
                 let network_config = NetworkConfig::network_with_id(NetworkId::Validator);
@@ -332,25 +339,26 @@ impl NodeConfig {
         self.test = Some(test);
     }
 
-    #[cfg(any(test, feature = "fuzzing"))]
+    fn default_config(serialized: &str, path: &'static str) -> Self {
+        let config = Self::parse(serialized).unwrap_or_else(|e| panic!("Error in {}: {}", path, e));
+        config
+            .validate_network_configs()
+            .unwrap_or_else(|e| panic!("Error in {}: {}", path, e))
+    }
+
     pub fn default_for_public_full_node() -> Self {
         let contents = std::include_str!("test_data/public_full_node.yaml");
-        let path = "default_for_public_full_node";
-        Self::parse(&contents).unwrap_or_else(|e| panic!("Error in {}: {}", path, e))
+        Self::default_config(contents, "default_for_public_full_node")
     }
 
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn default_for_validator() -> Self {
         let contents = std::include_str!("test_data/validator.yaml");
-        let path = "default_for_validator";
-        Self::parse(&contents).unwrap_or_else(|e| panic!("Error in {}: {}", path, e))
+        Self::default_config(contents, "default_for_validator")
     }
 
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn default_for_validator_full_node() -> Self {
         let contents = std::include_str!("test_data/validator_full_node.yaml");
-        let path = "default_for_validator_full_node";
-        Self::parse(&contents).unwrap_or_else(|e| panic!("Error in {}: {}", path, e))
+        Self::default_config(contents, "default_for_validator_full_node")
     }
 }
 
@@ -404,11 +412,11 @@ impl RootPath {
     }
 
     /// This adds a full path when loading / storing if one is not specified
-    pub fn full_path(&self, file_path: &PathBuf) -> PathBuf {
+    pub fn full_path(&self, file_path: &Path) -> PathBuf {
         if file_path.is_relative() {
             self.root_path.join(file_path)
         } else {
-            file_path.clone()
+            file_path.to_path_buf()
         }
     }
 }
@@ -443,6 +451,11 @@ mod test {
         NodeConfig::default_for_public_full_node();
         NodeConfig::default_for_validator();
         NodeConfig::default_for_validator_full_node();
+
+        let docker_public_full_node =
+            std::include_str!("../../../docker/compose/public_full_node/public_full_node.yaml");
+        // Only verify it is in the correct format as the values cannot be loaded for this config
+        NodeConfig::parse(docker_public_full_node).unwrap();
 
         let contents = std::include_str!("test_data/safety_rules.yaml");
         SafetyRulesConfig::parse(&contents)

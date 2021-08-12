@@ -1,12 +1,14 @@
 #!/bin/bash
-# Copyright (c) The Libra Core Contributors
+# Copyright (c) The Diem Core Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# adapted from --build-all-cti option from libra/docker/build-aws.sh, which is how
+# adapted from --build-all-cti option from diem/docker/build-aws.sh, which is how
 # land blocking test builds images before running cluster-test
-REPOS=(libra_validator libra_cluster_test libra_init libra_safety_rules)
+REPOS=(diem/validator diem/cluster_test diem/init diem/validator_tcb)
 # the number of commits backwards we want to look
 END=50
+
+BASE_REF=${BASE_REF:-main}
 
 image_tag_exists() {
     if [ -z $1 ]; then
@@ -30,8 +32,16 @@ image_tag_exists() {
 }
 
 for i in $(seq 0 $END); do
-    test_tag=land_$(git rev-parse --short=8 origin/master~$i)
+    test_rev=$(git rev-parse --short=8 origin/$BASE_REF~$i)
+    test_tag="land_$test_rev"
     image_tag_exists $test_tag && echo $retval_image_tag && exit 0
+    commit_message=$(git log -1 --pretty=oneline $test_rev)
+    echo $commit_message | grep '\[breaking\]'
+    ret=$?
+    if [ $ret -eq 0 ]; then
+        echo "Failed to find images built off of recent non-breaking changes"
+        exit 1
+    fi
 done
 
 exit 1

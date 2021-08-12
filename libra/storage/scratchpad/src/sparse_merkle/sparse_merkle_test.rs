@@ -1,51 +1,44 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    node::{LeafNode, LeafValue, SparseMerkleNode},
-    AccountStatus, ProofRead, SparseMerkleTree,
+use super::*;
+use crate::test_utils::{
+    proof_reader::ProofReader,
+    proptest_helpers::{arb_smt_correctness_case, test_smt_correctness_impl},
 };
-use libra_crypto::{
+use diem_crypto::{
     hash::{CryptoHash, TestOnlyHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
-use libra_types::{
+use diem_types::{
     account_state_blob::AccountStateBlob,
     proof::{SparseMerkleLeafNode, SparseMerkleProof},
 };
-use std::{collections::HashMap, sync::Arc};
+use proptest::prelude::*;
+
+fn update_byte(original_key: &HashValue, n: usize, byte: u8) -> HashValue {
+    let mut key = original_key.to_vec();
+    key[n] = byte;
+    HashValue::from_slice(&key).unwrap()
+}
 
 fn hash_internal(left_child: HashValue, right_child: HashValue) -> HashValue {
-    libra_types::proof::SparseMerkleInternalNode::new(left_child, right_child).hash()
+    diem_types::proof::SparseMerkleInternalNode::new(left_child, right_child).hash()
 }
 
 fn hash_leaf(key: HashValue, value_hash: HashValue) -> HashValue {
     SparseMerkleLeafNode::new(key, value_hash).hash()
 }
 
-#[derive(Default)]
-struct ProofReader(HashMap<HashValue, SparseMerkleProof>);
-
-impl ProofReader {
-    fn new(key_with_proof: Vec<(HashValue, SparseMerkleProof)>) -> Self {
-        ProofReader(key_with_proof.into_iter().collect())
-    }
-}
-
-impl ProofRead for ProofReader {
-    fn get_proof(&self, key: HashValue) -> Option<&SparseMerkleProof> {
-        self.0.get(&key)
-    }
-}
+type SparseMerkleTree = super::SparseMerkleTree<AccountStateBlob>;
+type SubTree = super::SubTree<AccountStateBlob>;
 
 #[test]
 fn test_construct_subtree_zero_siblings() {
     let node_hash = HashValue::new([1; HashValue::LENGTH]);
-    let node = SparseMerkleNode::new_subtree(node_hash);
-    let subtree_node =
-        SparseMerkleTree::construct_subtree(std::iter::empty(), std::iter::empty(), Arc::new(node));
-    let smt = SparseMerkleTree { root: subtree_node };
-    assert_eq!(smt.root_hash(), node_hash);
+    let leaf = SubTree::new_unknown(node_hash);
+    let subtree = SparseMerkleTree::construct_subtree(std::iter::empty(), std::iter::empty(), leaf);
+    assert_eq!(subtree.hash(), node_hash);
 }
 
 #[test]
@@ -60,34 +53,29 @@ fn test_construct_subtree_three_siblings() {
     let key = b"hello".test_only_hash();
     let blob = AccountStateBlob::from(b"world".to_vec());
     let leaf_hash = hash_leaf(key, blob.hash());
-    let node = SparseMerkleNode::new_leaf(key, LeafValue::BlobHash(blob.hash()));
+
+    let leaf = SubTree::new_leaf_with_value_hash(key, blob.hash());
     let bits = vec![false, false, true];
     let a_hash = HashValue::new([2; HashValue::LENGTH]);
     let b_hash = HashValue::new([3; HashValue::LENGTH]);
     let c_hash = HashValue::new([4; HashValue::LENGTH]);
     let siblings = vec![a_hash, b_hash, c_hash]
         .into_iter()
-        .map(|hash| Arc::new(SparseMerkleNode::new_subtree(hash)));
-    let subtree_node =
-        SparseMerkleTree::construct_subtree(bits.into_iter(), siblings, Arc::new(node));
-    let smt = SparseMerkleTree { root: subtree_node };
+        .map(SubTree::new_unknown);
+    let subtree = SparseMerkleTree::construct_subtree(bits.into_iter(), siblings, leaf);
 
     let z_hash = hash_internal(leaf_hash, a_hash);
     let y_hash = hash_internal(z_hash, b_hash);
     let root_hash = hash_internal(c_hash, y_hash);
-    assert_eq!(smt.root_hash(), root_hash);
+    assert_eq!(subtree.hash(), root_hash);
 }
 
 #[test]
 #[should_panic]
 fn test_construct_subtree_panic() {
     let node_hash = HashValue::new([1; HashValue::LENGTH]);
-    let node = SparseMerkleNode::new_subtree(node_hash);
-    let _subtree_node = SparseMerkleTree::construct_subtree(
-        std::iter::once(true),
-        std::iter::empty(),
-        Arc::new(node),
-    );
+    let unknown = SubTree::new_unknown(node_hash);
+    let _ = SparseMerkleTree::construct_subtree(std::iter::once(true), std::iter::empty(), unknown);
 }
 
 #[test]
@@ -96,19 +84,29 @@ fn test_construct_subtree_with_new_leaf_override_existing_leaf() {
     let old_blob = AccountStateBlob::from(b"old_old_old".to_vec());
     let new_blob = AccountStateBlob::from(b"new_new_new".to_vec());
 
-    let existing_leaf = LeafNode::new(key, LeafValue::BlobHash(old_blob.hash()));
+    let existing_leaf = SubTree::new_leaf_with_value_hash(key, old_blob.hash());
 
     let subtree = SparseMerkleTree::construct_subtree_with_new_leaf(
         key,
         new_blob.clone(),
-        &existing_leaf,
+        existing_leaf.clone(),
+        key,
         /* distance_from_root_to_existing_leaf = */ 3,
     );
-    let smt = SparseMerkleTree { root: subtree };
 
     let new_blob_hash = new_blob.hash();
     let root_hash = hash_leaf(key, new_blob_hash);
-    assert_eq!(smt.root_hash(), root_hash);
+    assert_eq!(subtree.hash(), root_hash);
+
+    // batch version api
+    let subtree_batch = SparseMerkleTree::batch_construct_subtree_with_existing_leaf(
+        vec![(key, &new_blob)].as_slice(),
+        existing_leaf,
+        key,
+        /* depth = */ 3,
+    );
+
+    assert_eq!(subtree_batch.hash(), root_hash);
 }
 
 #[test]
@@ -132,15 +130,7 @@ fn test_construct_subtree_with_new_leaf_create_extension() {
     assert_eq!(existing_key[0], 0b0100_0010);
     assert_eq!(new_key[0], 0b0100_1011);
 
-    let existing_leaf = LeafNode::new(existing_key, LeafValue::BlobHash(existing_blob.hash()));
-
-    let subtree = SparseMerkleTree::construct_subtree_with_new_leaf(
-        new_key,
-        new_blob.clone(),
-        &existing_leaf,
-        /* distance_from_root_to_existing_leaf = */ 2,
-    );
-    let smt = SparseMerkleTree { root: subtree };
+    let existing_leaf = SubTree::new_leaf_with_value_hash(existing_key, existing_blob.hash());
 
     let new_blob_hash = new_blob.hash();
     let existing_leaf_hash = hash_leaf(existing_key, existing_blob_hash);
@@ -148,23 +138,39 @@ fn test_construct_subtree_with_new_leaf_create_extension() {
     let x_hash = hash_internal(existing_leaf_hash, new_leaf_hash);
     let y_hash = hash_internal(x_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
     let root_hash = hash_internal(y_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
-    assert_eq!(smt.root_hash(), root_hash);
+
+    let subtree = SparseMerkleTree::construct_subtree_with_new_leaf(
+        new_key,
+        new_blob.clone(),
+        existing_leaf.clone(),
+        existing_key,
+        /* distance_from_root_to_existing_leaf = */ 2,
+    );
+    assert_eq!(subtree.hash(), root_hash);
+
+    // batch version api
+    let subtree_batch = SparseMerkleTree::batch_construct_subtree_with_existing_leaf(
+        vec![(new_key, &new_blob)].as_slice(),
+        existing_leaf,
+        existing_key,
+        /* depth = */ 2,
+    );
+    assert_eq!(subtree_batch.hash(), root_hash);
 }
 
 #[test]
 #[should_panic(expected = "Reached an internal node at the bottom of the tree.")]
 fn test_construct_subtree_at_bottom_found_internal_node() {
-    let left_child = Arc::new(SparseMerkleNode::new_subtree(HashValue::new(
-        [1; HashValue::LENGTH],
-    )));
-    let right_child = Arc::new(SparseMerkleNode::new_empty());
-    let current_node = Arc::new(SparseMerkleNode::new_internal(left_child, right_child));
+    let left_child = SubTree::new_unknown(HashValue::new([1; HashValue::LENGTH]));
+    let right_child = SubTree::new_empty();
+    let current = SubTree::new_internal(left_child, right_child);
+
     let key = b"hello".test_only_hash();
     let new_blob = AccountStateBlob::from(b"new_blob".to_vec());
     let remaining_bits = key.iter_bits();
     let proof_reader = ProofReader::default();
-    let _subtree_node = SparseMerkleTree::construct_subtree_at_bottom(
-        current_node,
+    let _ = SparseMerkleTree::construct_subtree_at_bottom(
+        &current,
         key,
         new_blob,
         remaining_bits,
@@ -193,10 +199,7 @@ fn test_construct_subtree_at_bottom_found_leaf_node() {
     assert_eq!(existing_key[0], 0b0100_0010);
     assert_eq!(new_key[0], 0b0100_1011);
 
-    let current_node = Arc::new(SparseMerkleNode::new_leaf(
-        existing_key,
-        LeafValue::BlobHash(existing_blob_hash),
-    ));
+    let current = SubTree::new_leaf_with_value_hash(existing_key, existing_blob_hash);
     let remaining_bits = {
         let mut iter = new_key.iter_bits();
         iter.next();
@@ -210,37 +213,36 @@ fn test_construct_subtree_at_bottom_found_leaf_node() {
     let proof = SparseMerkleProof::new(leaf, siblings);
     let proof_reader = ProofReader::new(vec![(new_key, proof)]);
 
-    let subtree = SparseMerkleTree::construct_subtree_at_bottom(
-        current_node,
-        new_key,
-        new_blob.clone(),
-        remaining_bits,
-        &proof_reader,
-    )
-    .unwrap();
-    let smt = SparseMerkleTree { root: subtree };
-
     let existing_leaf_hash = hash_leaf(existing_key, existing_blob_hash);
     let new_blob_hash = new_blob.hash();
     let new_leaf_hash = hash_leaf(new_key, new_blob_hash);
     let x_hash = hash_internal(existing_leaf_hash, new_leaf_hash);
     let y_hash = hash_internal(x_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
     let root_hash = hash_internal(y_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
-    assert_eq!(smt.root_hash(), root_hash);
+
+    let subtree = SparseMerkleTree::construct_subtree_at_bottom(
+        &current,
+        new_key,
+        new_blob,
+        remaining_bits,
+        &proof_reader,
+    )
+    .unwrap();
+    assert_eq!(subtree.hash(), root_hash);
 }
 
 #[test]
 fn test_construct_subtree_at_bottom_found_empty_node() {
-    //        root                  root
-    //       /    \                /    \
-    //      o      o              o      o
-    //     / \                   / \
+    //        root                      root
+    //       /    \                    /    \
+    //      o      o                  o      o
+    //     / \                       / \
     //    o   placeholder    =>     o   new_key
     let new_key = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".test_only_hash();
     let new_blob = AccountStateBlob::from(b"new_blob!!!!!".to_vec());
     assert_eq!(new_key[0], 0b0100_1011);
 
-    let current_node = Arc::new(SparseMerkleNode::new_empty());
+    let current = SubTree::new_empty();
     let remaining_bits = {
         let mut iter = new_key.iter_bits();
         // Skip first two.
@@ -250,19 +252,18 @@ fn test_construct_subtree_at_bottom_found_empty_node() {
     };
     let proof_reader = ProofReader::default();
 
+    let new_blob_hash = new_blob.hash();
+    let new_leaf_hash = hash_leaf(new_key, new_blob_hash);
+
     let subtree = SparseMerkleTree::construct_subtree_at_bottom(
-        current_node,
+        &current,
         new_key,
-        new_blob.clone(),
+        new_blob,
         remaining_bits,
         &proof_reader,
     )
     .unwrap();
-    let smt = SparseMerkleTree { root: subtree };
-
-    let new_blob_hash = new_blob.hash();
-    let new_leaf_hash = hash_leaf(new_key, new_blob_hash);
-    assert_eq!(smt.root_hash(), new_leaf_hash);
+    assert_eq!(subtree.hash(), new_leaf_hash);
 }
 
 #[test]
@@ -280,9 +281,7 @@ fn test_construct_subtree_at_bottom_found_subtree_node() {
     let new_blob = AccountStateBlob::from(b"new_blob!!!!!".to_vec());
     assert_eq!(new_key[0], 0b0101_1111);
 
-    let current_node = Arc::new(SparseMerkleNode::new_subtree(HashValue::new(
-        [1; HashValue::LENGTH],
-    )));
+    let current = SubTree::new_unknown(HashValue::new([1; HashValue::LENGTH]));
     let remaining_bits = {
         let mut iter = new_key.iter_bits();
         // Skip first two.
@@ -298,21 +297,20 @@ fn test_construct_subtree_at_bottom_found_subtree_node() {
     let proof = SparseMerkleProof::new(leaf, siblings);
     let proof_reader = ProofReader::new(vec![(new_key, proof)]);
 
-    let new_subtree = SparseMerkleTree::construct_subtree_at_bottom(
-        current_node,
-        new_key,
-        new_blob.clone(),
-        remaining_bits,
-        &proof_reader,
-    )
-    .unwrap();
-    let smt = SparseMerkleTree { root: new_subtree };
-
     let new_blob_hash = new_blob.hash();
     let new_leaf_hash = hash_leaf(new_key, new_blob_hash);
     let x_hash = hash_internal(HashValue::new([6; HashValue::LENGTH]), new_leaf_hash);
     let new_subtree_hash = hash_internal(x_hash, HashValue::new([5; HashValue::LENGTH]));
-    assert_eq!(smt.root_hash(), new_subtree_hash);
+
+    let subtree = SparseMerkleTree::construct_subtree_at_bottom(
+        &current,
+        new_key,
+        new_blob,
+        remaining_bits,
+        &proof_reader,
+    )
+    .unwrap();
+    assert_eq!(subtree.hash(), new_subtree_hash);
 }
 
 #[test]
@@ -363,9 +361,7 @@ fn test_update_256_siblings_in_proof() {
     let new_blob1 = AccountStateBlob::from(b"value1111111111111".to_vec());
     let proof_reader = ProofReader::new(vec![(key1, proof_of_key1)]);
     let smt = SparseMerkleTree::new(old_root_hash);
-    let new_smt = smt
-        .update(vec![(key1, new_blob1.clone())], &proof_reader)
-        .unwrap();
+    let new_smt = smt.update(vec![(key1, &new_blob1)], &proof_reader).unwrap();
 
     let new_blob1_hash = new_blob1.hash();
     let new_leaf1_hash = hash_leaf(key1, new_blob1_hash);
@@ -385,7 +381,7 @@ fn test_update_256_siblings_in_proof() {
 fn test_new_subtree() {
     let root_hash = HashValue::new([1; HashValue::LENGTH]);
     let smt = SparseMerkleTree::new(root_hash);
-    assert!(smt.root.read_lock().is_subtree());
+    assert!(smt.root_weak().is_unknown());
     assert_eq!(smt.root_hash(), root_hash);
 }
 
@@ -393,7 +389,7 @@ fn test_new_subtree() {
 fn test_new_empty() {
     let root_hash = *SPARSE_MERKLE_PLACEHOLDER_HASH;
     let smt = SparseMerkleTree::new(root_hash);
-    assert!(smt.root.read_lock().is_empty());
+    assert!(smt.root_weak().is_empty());
     assert_eq!(smt.root_hash(), root_hash);
 }
 
@@ -438,7 +434,7 @@ fn test_update() {
     let proof_reader = ProofReader::new(vec![(key4, proof)]);
     let old_smt = SparseMerkleTree::new(old_root_hash);
     let smt1 = old_smt
-        .update(vec![(key4, value4.clone())], &proof_reader)
+        .update(vec![(key4, &value4)], &proof_reader)
         .unwrap();
 
     // Now smt1 should look like this:
@@ -475,16 +471,14 @@ fn test_update() {
 
     let value1 = AccountStateBlob::from(b"value11111".to_vec());
     let proof_reader = ProofReader::new(vec![(key1, proof)]);
-    let smt2 = smt1
-        .update(vec![(key1, value1.clone())], &proof_reader)
-        .unwrap();
+    let smt2 = smt1.update(vec![(key1, &value1)], &proof_reader).unwrap();
 
     // Now the tree looks like:
     //              root
     //             /    \
     //            y      key3 (subtree)
     //           / \
-    //          x   key4
+    //          x   key4 (from smt1)
     //         / \
     //     key1    key2 (subtree)
     assert_eq!(
@@ -507,10 +501,15 @@ fn test_update() {
     let value4 = AccountStateBlob::from(b"new value 4444444444".to_vec());
     // key4 already exists in the tree.
     let proof_reader = ProofReader::default();
-    let smt22 = smt1
-        .update(vec![(key4, value4.clone())], &proof_reader)
-        .unwrap();
+    let smt22 = smt1.update(vec![(key4, &value4)], &proof_reader).unwrap();
 
+    // smt22 is like:
+    // Now smt1 should look like this:
+    //             root
+    //            /    \
+    //           y'      key3 (subtree)
+    //          / \
+    //         x   key4
     assert_eq!(smt22.get(key1), AccountStatus::Unknown);
     assert_eq!(smt22.get(key2), AccountStatus::Unknown);
     assert_eq!(smt22.get(key3), AccountStatus::Unknown);
@@ -535,4 +534,132 @@ fn test_update() {
     assert_eq!(smt22.get(key2), AccountStatus::Unknown);
     assert_eq!(smt22.get(key3), AccountStatus::Unknown);
     assert_eq!(smt22.get(key4), AccountStatus::ExistsInScratchPad(value4));
+}
+
+#[test]
+fn test_drop() {
+    let mut smt = SparseMerkleTree::new(*SPARSE_MERKLE_PLACEHOLDER_HASH);
+    let proof_reader = ProofReader::default();
+    for _ in 0..100000 {
+        smt = smt
+            .update(
+                vec![(HashValue::zero(), &AccountStateBlob::from(b"zero".to_vec()))],
+                &proof_reader,
+            )
+            .unwrap()
+    }
+
+    // smt with a lot of ancestors being dropped here. It's a stack overflow if a manual iterative
+    // `Drop` implementation is not in place.
+}
+
+#[test]
+fn test_batch_update_construct_subtree_from_proofs() {
+    // Before the update, the tree was:
+    //             root
+    //            /    \
+    //           y      key3
+    //          / \
+    //         x   placeholder
+    //        / \
+    //    key1   key2
+    let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
+    let value1 = AccountStateBlob::from(b"value1".to_vec());
+
+    let key2 = update_byte(&key1, 0, 0b0010_0100);
+    let value2 = AccountStateBlob::from(b"value2".to_vec());
+
+    let key3 = update_byte(&key1, 0, 0b1110_0111);
+    let value3 = AccountStateBlob::from(b"value3".to_vec());
+    let new_value3 = AccountStateBlob::from(b"new_value3".to_vec());
+
+    let value1_hash = value1.hash();
+    let value2_hash = value2.hash();
+    let value3_hash = value3.hash();
+
+    // A new key at the "placeholder" position.
+    let key4 = update_byte(&key1, 0, 0b0100_1100);
+    let value4 = AccountStateBlob::from(b"value4".to_vec());
+
+    // A new key that shares path with key1.
+    let key5 = update_byte(&key1, 0, 0b0001_0000);
+    let value5 = AccountStateBlob::from(b"value5".to_vec());
+
+    // Two new keys that shares path with key2.
+    let key6 = update_byte(&key1, 0, 0b0010_0000);
+    let value6 = AccountStateBlob::from(b"value6".to_vec());
+    let key7 = update_byte(&key1, 0, 0b0011_0000);
+    let value7 = AccountStateBlob::from(b"value7".to_vec());
+
+    // Create a proof for this new key.
+    let leaf1 = SparseMerkleLeafNode::new(key1, value1_hash);
+    let leaf2 = SparseMerkleLeafNode::new(key2, value2_hash);
+    let leaf3 = SparseMerkleLeafNode::new(key3, value3_hash);
+    let leaf1_hash = leaf1.hash();
+    let leaf2_hash = leaf2.hash();
+    let leaf3_hash = leaf3.hash();
+    let x_hash = hash_internal(leaf1_hash, leaf2_hash);
+    let y_hash = hash_internal(x_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
+    let old_root_hash = hash_internal(y_hash, leaf3_hash);
+
+    let proof3 = SparseMerkleProof::new(Some(leaf3), vec![y_hash]);
+    assert!(proof3.verify(old_root_hash, key3, Some(&value3)).is_ok());
+    let proof4 = SparseMerkleProof::new(None, vec![x_hash, leaf3_hash]);
+    assert!(proof4.verify(old_root_hash, key4, None).is_ok());
+    let proof5 = SparseMerkleProof::new(
+        Some(leaf1),
+        vec![leaf2_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH, leaf3_hash],
+    );
+    assert!(proof5.verify(old_root_hash, key5, None).is_ok());
+
+    let proof67 = SparseMerkleProof::new(
+        Some(leaf2),
+        vec![leaf1_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH, leaf3_hash],
+    );
+    assert!(proof67.verify(old_root_hash, key6, None).is_ok());
+    assert!(proof67.verify(old_root_hash, key7, None).is_ok());
+
+    // Create the old tree and update the tree with new value and proof.
+    let proof_reader = ProofReader::new(vec![
+        (key3, proof3),
+        (key4, proof4),
+        (key5, proof5),
+        (key6, proof67.clone()),
+        (key7, proof67),
+    ]);
+
+    let smt_serial = SparseMerkleTree::new(*SPARSE_MERKLE_PLACEHOLDER_HASH)
+        .serial_update(
+            vec![vec![
+                (key3, &new_value3),
+                (key4, &value4),
+                (key5, &value5),
+                (key6, &value6),
+                (key7, &value7),
+            ]],
+            &proof_reader,
+        )
+        .unwrap()
+        .1;
+
+    let smt_batch = SparseMerkleTree::new(*SPARSE_MERKLE_PLACEHOLDER_HASH)
+        .batch_update(
+            vec![
+                (key3, &new_value3),
+                (key4, &value4),
+                (key5, &value5),
+                (key6, &value6),
+                (key7, &value7),
+            ],
+            &proof_reader,
+        )
+        .unwrap();
+
+    assert_eq!(smt_serial.root_hash(), smt_batch.root_hash());
+}
+proptest! {
+    #[test]
+    fn test_correctness( input in arb_smt_correctness_case() ) {
+        test_smt_correctness_impl(input)
+    }
 }

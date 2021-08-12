@@ -1,13 +1,35 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use libra_types::{
+use diem_types::{
     mempool_status::{MempoolStatus, MempoolStatusCode},
     vm_status::{StatusCode, StatusType},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::Method;
+
+/// list of server internal errors
+pub static INTERNAL_ERRORS: &[i16; 7] = &[
+    ServerCode::DefaultServerError as i16,
+    ServerCode::VmInvariantViolationError as i16,
+    ServerCode::VmExecutionError as i16,
+    ServerCode::VmUnknownError as i16,
+    ServerCode::MempoolIsFull as i16,
+    ServerCode::MempoolTooManyTransactions as i16,
+    ServerCode::MempoolUnknownError as i16,
+];
+
+pub fn is_internal_error(err_code: &i16) -> bool {
+    for code in INTERNAL_ERRORS {
+        if code == err_code {
+            return true;
+        }
+    }
+    false
+}
 
 /// Custom JSON RPC server error codes
 /// Ranges from -32000 to -32099 - see `https://www.jsonrpc.org/specification#error_object` for details
@@ -38,7 +60,6 @@ pub enum InvalidRequestCode {
     InvalidParams = -32602,
     // -32603 is internal error
     InvalidFormat = -32604,
-    ParseError = -32700,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,6 +90,12 @@ impl From<serde_json::error::Error> for JsonRpcError {
 
 impl From<anyhow::Error> for JsonRpcError {
     fn from(err: anyhow::Error) -> Self {
+        JsonRpcError::internal_error(err.to_string())
+    }
+}
+
+impl From<bcs::Error> for JsonRpcError {
+    fn from(err: bcs::Error) -> Self {
         JsonRpcError::internal_error(err.to_string())
     }
 }
@@ -106,11 +133,11 @@ impl JsonRpcError {
         }
     }
 
-    pub fn invalid_params(data: Option<ErrorData>) -> Self {
+    pub fn invalid_params(method: Method) -> Self {
         Self {
             code: InvalidRequestCode::InvalidParams as i16,
-            message: "Invalid params".to_string(),
-            data,
+            message: format!("Invalid params for method '{}'", method.as_str()),
+            data: None,
         }
     }
 
@@ -122,13 +149,18 @@ impl JsonRpcError {
         }
     }
 
-    pub fn invalid_param(index: usize, name: &str, type_info: &str) -> Self {
+    pub fn invalid_param(msg: &str) -> Self {
         Self {
             code: InvalidRequestCode::InvalidParams as i16,
-            message: format!(
-                "Invalid param {}(params[{}]): should be {}",
-                name, index, type_info
-            ),
+            message: format!("Invalid param {}", msg),
+            data: None,
+        }
+    }
+
+    pub fn invalid_params_from_method(method: Method) -> Self {
+        Self {
+            code: InvalidRequestCode::InvalidParams as i16,
+            message: format!("Invalid params for method '{}'", method.as_str()),
             data: None,
         }
     }
@@ -198,5 +230,97 @@ impl JsonRpcError {
             return Some(*data);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::{is_internal_error, JsonRpcError, ServerCode, INTERNAL_ERRORS};
+    use diem_types::{
+        mempool_status::{MempoolStatus, MempoolStatusCode},
+        vm_status::StatusCode,
+    };
+
+    #[test]
+    fn test_vm_status() {
+        assert_map_vm_code(
+            StatusCode::UNKNOWN_VALIDATION_STATUS,
+            ServerCode::VmValidationError,
+        );
+
+        let err = JsonRpcError::vm_status(StatusCode::UNKNOWN_VERIFICATION_ERROR);
+        assert_eq!(err.code, ServerCode::VmVerificationError as i16);
+        assert_map_vm_code(
+            StatusCode::UNKNOWN_VERIFICATION_ERROR,
+            ServerCode::VmVerificationError,
+        );
+
+        assert_map_vm_code(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            ServerCode::VmInvariantViolationError,
+        );
+
+        assert_map_vm_code(
+            StatusCode::UNKNOWN_BINARY_ERROR,
+            ServerCode::VmDeserializationError,
+        );
+        assert_map_vm_code(
+            StatusCode::UNKNOWN_RUNTIME_STATUS,
+            ServerCode::VmExecutionError,
+        );
+        assert_map_vm_code(StatusCode::UNKNOWN_STATUS, ServerCode::VmUnknownError);
+    }
+
+    fn assert_map_vm_code(from: StatusCode, to: ServerCode) {
+        let err = JsonRpcError::vm_status(from);
+        assert_eq!(err.code, to as i16);
+    }
+
+    #[test]
+    fn test_mempool_error() {
+        let err = JsonRpcError::mempool_error(MempoolStatus {
+            code: MempoolStatusCode::Accepted,
+            message: "error msg".to_string(),
+        });
+        assert!(err.is_err());
+
+        assert_map_code(
+            MempoolStatusCode::InvalidSeqNumber,
+            ServerCode::MempoolInvalidSeqNumber,
+        );
+        assert_map_code(MempoolStatusCode::MempoolIsFull, ServerCode::MempoolIsFull);
+        assert_map_code(
+            MempoolStatusCode::TooManyTransactions,
+            ServerCode::MempoolTooManyTransactions,
+        );
+        assert_map_code(
+            MempoolStatusCode::InvalidUpdate,
+            ServerCode::MempoolInvalidUpdate,
+        );
+        assert_map_code(MempoolStatusCode::VmError, ServerCode::MempoolVmError);
+        assert_map_code(
+            MempoolStatusCode::UnknownStatus,
+            ServerCode::MempoolUnknownError,
+        );
+    }
+
+    #[test]
+    fn test_is_internal_error() {
+        for code in INTERNAL_ERRORS {
+            assert!(is_internal_error(code));
+        }
+        assert!(!is_internal_error(
+            &(ServerCode::MempoolInvalidUpdate as i16)
+        ));
+        assert!(!is_internal_error(&(ServerCode::VmValidationError as i16)));
+    }
+
+    fn assert_map_code(from: MempoolStatusCode, to: ServerCode) {
+        let err = JsonRpcError::mempool_error(MempoolStatus {
+            code: from,
+            message: "error msg".to_string(),
+        })
+        .unwrap();
+        assert_eq!(err.code, to as i16);
     }
 }

@@ -1,8 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     persistent_safety_storage::PersistentSafetyStorage, serializer::SerializerService, SafetyRules,
+    TSafetyRules,
 };
 use consensus_types::{
     block::Block,
@@ -13,15 +14,15 @@ use consensus_types::{
     vote_data::VoteData,
     vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
-use libra_crypto::{
+use diem_crypto::{
     ed25519::Ed25519PrivateKey,
     hash::{CryptoHash, TransactionAccumulatorHasher},
     traits::SigningKey,
     Uniform,
 };
-use libra_secure_storage::{InMemoryStorage, Storage};
-use libra_time::duration_since_epoch;
-use libra_types::{
+use diem_infallible::duration_since_epoch;
+use diem_secure_storage::{InMemoryStorage, Storage};
+use diem_types::{
     block_info::BlockInfo,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
@@ -219,14 +220,26 @@ pub fn test_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
         signer.private_key().clone(),
         Ed25519PrivateKey::generate_for_testing(),
         waypoint,
+        true,
     )
 }
 
-/// Returns a simple serializer for testing purposes.
+/// Returns a safety rules instance for testing purposes.
 pub fn test_safety_rules() -> SafetyRules {
     let signer = ValidatorSigner::from_int(0);
     let storage = test_storage(&signer);
-    SafetyRules::new(storage, true)
+    let (epoch_change_proof, _) = make_genesis(&signer);
+
+    let mut safety_rules = SafetyRules::new(storage, true, false);
+    safety_rules.initialize(&epoch_change_proof).unwrap();
+    safety_rules
+}
+
+/// Returns a safety rules instance that has not been initialized for testing purposes.
+pub fn test_safety_rules_uninitialized() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    SafetyRules::new(storage, true, false)
 }
 
 /// Returns a simple serializer for testing purposes.

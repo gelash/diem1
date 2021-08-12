@@ -1,17 +1,18 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     interpreter::Interpreter,
     loader::{Function, Loader},
+    logging::LogContext,
 };
+use move_binary_format::file_format::Bytecode;
 use move_vm_types::values::{self, Locals};
 use std::{
     collections::BTreeSet,
     io::{self, Write},
     str::FromStr,
 };
-use vm::file_format::Bytecode;
 
 #[derive(Debug)]
 enum DebugCommand {
@@ -103,7 +104,7 @@ impl DebugContext {
         pc: u16,
         instr: &Bytecode,
         resolver: &Loader,
-        interp: &Interpreter,
+        interp: &Interpreter<impl LogContext>,
     ) {
         let instr_string = format!("{:?}", instr);
         let function_string = function_desc.pretty_string();

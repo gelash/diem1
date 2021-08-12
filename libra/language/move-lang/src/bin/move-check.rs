@@ -1,11 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use move_lang::{
     command_line::{self as cli},
-    shared::*,
+    shared::Flags,
 };
 use structopt::*;
 
@@ -27,21 +27,27 @@ pub struct Options {
     )]
     pub dependencies: Vec<String>,
 
-    /// The sender address for modules and scripts
+    /// The output directory for saved artifacts, namely any 'move' interface files generated from
+    /// 'mv' files
     #[structopt(
-        name = "ADDRESS",
-        short = cli::SENDER_SHORT,
-        long = cli::SENDER,
-        parse(try_from_str = cli::parse_address)
+        name = "PATH_TO_OUTPUT_DIRECTORY",
+        short = cli::OUT_DIR_SHORT,
+        long = cli::OUT_DIR,
     )]
-    pub sender: Option<Address>,
+    pub out_dir: Option<String>,
+
+    #[structopt(flatten)]
+    pub flags: Flags,
 }
 
 pub fn main() -> anyhow::Result<()> {
     let Options {
         source_files,
         dependencies,
-        sender,
+        out_dir,
+        flags,
     } = Options::from_args();
-    move_lang::move_check(&source_files, &dependencies, sender)
+
+    let _files = move_lang::move_check_and_report(&source_files, &dependencies, out_dir, flags)?;
+    Ok(())
 }

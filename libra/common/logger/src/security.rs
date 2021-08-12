@@ -1,86 +1,85 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //!
 //! The security module gathers security-related logs:
 //! logs to detect malicious behavior from other validators.
 //!
-//! ```
-//! use libra_logger::prelude::*;
+//! TODO: This likely belongs outside of the logging crate
 //!
-//! sl_error!(
-//!   security_log(security_events::INVALID_RETRIEVED_BLOCK)
-//!     .data("some_data", "the data")
+//! ```
+//! use diem_logger::{error, SecurityEvent};
+//!
+//! error!(
+//!     SecurityEvent::InvalidRetrievedBlock,
+//!     "some_key" = "some data",
 //! );
 //! ```
 //!
 
-use crate::StructuredLogEntry;
+use crate::{Key, Schema, Value, Visitor};
+use serde::{Deserialize, Serialize};
 
-/// helper function to create a security log
-pub fn security_log(name: &'static str) -> StructuredLogEntry {
-    StructuredLogEntry::new_named("security", &name)
-}
-
-/// Security events that are possible
-pub mod security_events {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityEvent {
+    //
     // Mempool
-    // -------
-
+    //
     /// Mempool received a transaction from another peer with an invalid signature
-    pub const INVALID_TRANSACTION_MP: &str = "InvalidTransactionMP";
+    InvalidTransactionMempool,
 
     /// Mempool received an invalid network event
-    pub const INVALID_NETWORK_EVENT_MP: &str = "INVALID_NETWORK_EVENT_MP";
+    InvalidNetworkEventMempool,
 
     // Consensus
     // ---------
-
-    /// Consensus received an invalid message (not well-formed or incorrect signature)
-    pub const CONSENSUS_INVALID_MESSAGE: &str = "ConsensusInvalidMessage";
+    /// Consensus received an invalid message (not well-formed, invalid vote data or incorrect signature)
+    ConsensusInvalidMessage,
 
     /// Consensus received an equivocating vote
-    pub const CONSENSUS_EQUIVOCATING_VOTE: &str = "ConsensusEquivocatingVote";
+    ConsensusEquivocatingVote,
 
     /// Consensus received an invalid proposal
-    pub const INVALID_CONSENSUS_PROPOSAL: &str = "InvalidConsensusProposal";
-
-    /// Consensus received an invalid vote
-    pub const INVALID_CONSENSUS_VOTE: &str = "InvalidConsensusVote";
+    InvalidConsensusProposal,
 
     /// Consensus received an invalid new round message
-    pub const INVALID_CONSENSUS_ROUND: &str = "InvalidConsensusRound";
+    InvalidConsensusRound,
 
     /// Consensus received an invalid sync info message
-    pub const INVALID_SYNC_INFO_MSG: &str = "InvalidSyncInfoMsg";
+    InvalidSyncInfoMsg,
 
     /// A received block is invalid
-    pub const INVALID_RETRIEVED_BLOCK: &str = "InvalidRetrievedBlock";
+    InvalidRetrievedBlock,
 
     /// A block being committed or executed is invalid
-    pub const INVALID_BLOCK: &str = "InvalidBlock";
+    InvalidBlock,
 
     // State-Sync
     // ----------
-
     /// Invalid chunk of transactions received
-    pub const STATE_SYNC_INVALID_CHUNK: &str = "InvalidChunk";
+    StateSyncInvalidChunk,
 
     // Health Checker
     // --------------
-
     /// HealthChecker received an invalid network event
-    pub const INVALID_NETWORK_EVENT_HC: &str = "InvalidNetworkEventHC";
+    InvalidNetworkEventHC,
 
     /// HealthChecker received an invalid message
-    pub const INVALID_HEALTHCHECKER_MSG: &str = "InvalidHealthCheckerMsg";
+    InvalidHealthCheckerMsg,
 
     // Network
     // -------
+    /// Network received an invalid message from a remote peer
+    InvalidNetworkEvent,
 
-    /// Network identified an invalid peer
-    pub const INVALID_NETWORK_PEER: &str = "InvalidNetworkPeer";
+    /// A failed noise handshake that's either a clear bug or indicates some
+    /// security issue.
+    NoiseHandshake,
+}
 
-    /// Network couldn't negotiate
-    pub const INVALID_NETWORK_HANDSHAKE_MSG: &str = "InvalidNetworkHandshakeMsg";
+impl Schema for SecurityEvent {
+    fn visit(&self, visitor: &mut dyn Visitor) {
+        visitor.visit_pair(Key::new("security-event"), Value::from_serde(self))
+    }
 }

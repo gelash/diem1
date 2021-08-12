@@ -1,7 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use structopt::StructOpt;
+
 use backup_cli::{
     backup_types::{
         epoch_ending::backup::{EpochEndingBackupController, EpochEndingBackupOpt},
@@ -13,14 +17,14 @@ use backup_cli::{
     storage::StorageOpt,
     utils::{
         backup_service_client::{BackupServiceClient, BackupServiceClientOpt},
-        GlobalBackupOpt,
+        ConcurrentDownloadsOpt, GlobalBackupOpt,
     },
 };
-use std::sync::Arc;
-use structopt::StructOpt;
+use diem_logger::{prelude::*, Level, Logger};
+use diem_secure_push_metrics::MetricsPusher;
 
 #[derive(StructOpt)]
-#[structopt(about = "Libra backup tool.")]
+#[structopt(about = "Diem backup tool.")]
 enum Command {
     #[structopt(about = "Manually run one shot commands.")]
     OneShot(OneShotCommand),
@@ -30,7 +34,7 @@ enum Command {
 
 #[derive(StructOpt)]
 enum OneShotCommand {
-    #[structopt(about = "Query the backup service builtin in the local Libra node.")]
+    #[structopt(about = "Query the backup service builtin in the local Diem node.")]
     Query(OneShotQueryType),
     #[structopt(about = "Do a one shot backup.")]
     Backup(OneShotBackupOpt),
@@ -39,7 +43,7 @@ enum OneShotCommand {
 #[derive(StructOpt)]
 enum OneShotQueryType {
     #[structopt(
-        about = "Queries the latest epoch, committed version and synced version of the local Libra \
+        about = "Queries the latest epoch, committed version and synced version of the local Diem \
         node, via the backup service within it."
     )]
     NodeState(OneShotQueryNodeStateOpt),
@@ -59,6 +63,8 @@ struct OneShotQueryNodeStateOpt {
 struct OneShotQueryBackupStorageStateOpt {
     #[structopt(flatten)]
     metadata_cache: MetadataCacheOpt,
+    #[structopt(flatten)]
+    concurrent_downloads: ConcurrentDownloadsOpt,
     #[structopt(subcommand)]
     storage: StorageOpt,
 }
@@ -120,6 +126,16 @@ struct CoordinatorRunOpt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    main_impl().await.map_err(|e| {
+        error!("main_impl() failed: {}", e);
+        e
+    })
+}
+
+async fn main_impl() -> Result<()> {
+    Logger::new().level(Level::Info).read_env().init();
+    let _mp = MetricsPusher::start();
+
     let cmd = Command::from_args();
     match cmd {
         Command::OneShot(one_shot_cmd) => match one_shot_cmd {
@@ -136,6 +152,7 @@ async fn main() -> Result<()> {
                     let view = cache::sync_and_load(
                         &opt.metadata_cache,
                         opt.storage.init_storage().await?,
+                        opt.concurrent_downloads.get(),
                     )
                     .await?;
                     println!("{}", view.get_storage_state())

@@ -1,8 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::storage::command_adapter::config::EnvVar;
+use crate::{storage::command_adapter::config::EnvVar, utils::error_notes::ErrorNotes};
 use anyhow::{bail, ensure, Result};
+use diem_logger::prelude::*;
 use futures::{
     future::BoxFuture,
     task::{Context, Poll},
@@ -13,21 +14,25 @@ use std::{
     process::Stdio,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     macros::support::Pin,
     process::{Child, ChildStdin, ChildStdout},
 };
 
 pub(super) struct Command {
     cmd_str: String,
-    env_vars: Vec<EnvVar>,
+    // API parameters, like $FILE_HANDLE for `open_for_read()`
+    param_env_vars: Vec<EnvVar>,
+    // Env vars defined in the config file.
+    config_env_vars: Vec<EnvVar>,
 }
 
 impl Command {
-    pub fn new(raw_cmd: &str, env_vars: Vec<EnvVar>) -> Self {
+    pub fn new(raw_cmd: &str, param_env_vars: Vec<EnvVar>, config_env_vars: Vec<EnvVar>) -> Self {
         Self {
             cmd_str: format!("set -o nounset -o errexit -o pipefail; {}", raw_cmd),
-            env_vars,
+            param_env_vars,
+            config_env_vars,
         }
     }
 
@@ -40,9 +45,9 @@ impl Debug for Command {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#""{}" with env vars [{}]"#,
+            r#""{}" with params [{}]"#,
             self.cmd_str,
-            self.env_vars
+            self.param_env_vars
                 .iter()
                 .map(|v| format!("{}={}", v.key, v.value))
                 .collect::<Vec<_>>()
@@ -58,19 +63,31 @@ pub(super) struct SpawnedCommand {
 
 impl SpawnedCommand {
     pub fn spawn(command: Command) -> Result<Self> {
-        println!("Spawning {:?}", command);
+        debug!("Spawning {:?}", command);
 
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(&["-c", &command.cmd_str]);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        for v in &command.env_vars {
+        for v in command
+            .config_env_vars
+            .iter()
+            .chain(command.param_env_vars.iter())
+        {
             cmd.env(&v.key, &v.value);
         }
-        let child = cmd.spawn()?;
-        ensure!(child.stdin.is_some(), "child.stdin is None.");
-        ensure!(child.stdout.is_some(), "child.stdout is None.");
+        let child = cmd.spawn().err_notes(&cmd)?;
+        ensure!(
+            child.stdin.is_some(),
+            "child.stdin is None. cmd: {:?}",
+            &command,
+        );
+        ensure!(
+            child.stdout.is_some(),
+            "child.stdout is None. cmd: {:?}",
+            &command,
+        );
 
         Ok(Self { command, child })
     }
@@ -127,22 +144,23 @@ impl<'a> AsyncRead for ChildStdoutAsDataSource<'a> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<tokio::io::Result<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<::std::io::Result<()>> {
         if self.child.is_some() {
+            let filled_before_poll = buf.filled().len();
             let res = Pin::new(self.child.as_mut().unwrap().stdout()).poll_read(cx, buf);
-            if let Poll::Ready(Ok(0)) = res {
-                // hit EOF, start joining self.child
-                self.join_fut = Some(self.child.take().unwrap().join().boxed());
-            } else {
-                return res;
+            match res {
+                Poll::Ready(Ok(())) if buf.filled().len() == filled_before_poll => {
+                    // hit EOF, start joining self.child
+                    self.join_fut = Some(self.child.take().unwrap().join().boxed());
+                }
+                _ => return res,
             }
         }
 
         Pin::new(self.join_fut.as_mut().unwrap())
             .poll(cx)
-            .map_ok(|_| 0)
-            .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::Other, e))
+            .map_err(|e| ::std::io::Error::new(::std::io::ErrorKind::Other, e))
     }
 }
 

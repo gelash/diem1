@@ -1,13 +1,12 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::layout::Layout;
-use libra_crypto::ed25519::Ed25519PublicKey;
-use libra_global_constants::{LIBRA_ROOT_KEY, OPERATOR_KEY, OWNER_KEY};
-use libra_management::{
-    config::ConfigPath, constants, error::Error, secure_backend::SharedBackend,
-};
-use libra_types::{
+use diem_crypto::ed25519::Ed25519PublicKey;
+use diem_global_constants::{DIEM_ROOT_KEY, OPERATOR_KEY, OWNER_KEY};
+use diem_management::{config::ConfigPath, constants, error::Error, secure_backend::SharedBackend};
+use diem_transaction_builder::stdlib as transaction_builder;
+use diem_types::{
     account_address,
     chain_id::ChainId,
     transaction::{Transaction, TransactionPayload},
@@ -31,7 +30,7 @@ pub struct Genesis {
 }
 
 impl Genesis {
-    fn config(&self) -> Result<libra_management::config::Config, Error> {
+    fn config(&self) -> Result<diem_management::config::Config, Error> {
         self.config
             .load()?
             .override_chain_id(self.chain_id)
@@ -40,24 +39,29 @@ impl Genesis {
 
     pub fn execute(self) -> Result<Transaction, Error> {
         let layout = self.layout()?;
-        let libra_root_key = self.libra_root_key(&layout)?;
+        let diem_root_key = self.diem_root_key(&layout)?;
+        let treasury_compliance_key = self.treasury_compliance_key(&layout)?;
         let operator_assignments = self.operator_assignments(&layout)?;
         let operator_registrations = self.operator_registrations(&layout)?;
 
+        let chain_id = self.config()?.chain_id;
+        // Only have an allowlist of stdlib scripts
+        let script_policy = None;
+
         let genesis = vm_genesis::encode_genesis_transaction(
-            libra_root_key,
+            diem_root_key,
+            treasury_compliance_key,
             &operator_assignments,
             &operator_registrations,
-            // TODO: swap back by 8/15
-            Some(libra_types::on_chain_config::VMPublishingOption::open()),
-            self.config()?.chain_id,
+            script_policy,
+            chain_id,
         );
 
         if let Some(path) = self.path {
             let mut file = File::create(path).map_err(|e| {
                 Error::UnexpectedError(format!("Unable to create genesis file: {}", e.to_string()))
             })?;
-            let bytes = lcs::to_bytes(&genesis).map_err(|e| {
+            let bytes = bcs::to_bytes(&genesis).map_err(|e| {
                 Error::UnexpectedError(format!("Unable to serialize genesis: {}", e.to_string()))
             })?;
             file.write_all(&bytes).map_err(|e| {
@@ -68,12 +72,12 @@ impl Genesis {
         Ok(genesis)
     }
 
-    /// Retrieves the libra root key from the remote storage. Note, at this point in time, genesis
-    /// only supports a single libra root key.
-    pub fn libra_root_key(&self, layout: &Layout) -> Result<Ed25519PublicKey, Error> {
+    /// Retrieves the diem root key from the remote storage. Note, at this point in time, genesis
+    /// only supports a single diem root key.
+    pub fn diem_root_key(&self, layout: &Layout) -> Result<Ed25519PublicKey, Error> {
         let config = self.config()?;
-        let storage = config.shared_backend_with_namespace(layout.libra_root[0].clone());
-        storage.ed25519_key(LIBRA_ROOT_KEY)
+        let storage = config.shared_backend_with_namespace(layout.diem_root.clone());
+        storage.ed25519_key(DIEM_ROOT_KEY)
     }
 
     /// Retrieves a layout from the remote storage.
@@ -92,17 +96,22 @@ impl Genesis {
 
         for owner in layout.owners.iter() {
             let owner_storage = config.shared_backend_with_namespace(owner.into());
-            let owner_key = owner_storage.ed25519_key(OWNER_KEY)?;
+            let owner_key = owner_storage.ed25519_key(OWNER_KEY).ok();
 
             let operator_name = owner_storage.string(constants::VALIDATOR_OPERATOR)?;
-            let operator_storage = config.shared_backend_with_namespace(operator_name);
+            let operator_storage = config.shared_backend_with_namespace(operator_name.clone());
             let operator_key = operator_storage.ed25519_key(OPERATOR_KEY)?;
             let operator_account = account_address::from_public_key(&operator_key);
 
             let set_operator_script =
-                transaction_builder::encode_set_validator_operator_script(vec![], operator_account);
+                transaction_builder::encode_set_validator_operator_script_function(
+                    operator_name.as_bytes().to_vec(),
+                    operator_account,
+                )
+                .into_script_function();
 
-            operator_assignments.push((owner_key, set_operator_script));
+            let owner_name_vec = owner.as_bytes().to_vec();
+            operator_assignments.push((owner_key, owner_name_vec, set_operator_script));
         }
 
         Ok(operator_assignments)
@@ -122,15 +131,26 @@ impl Genesis {
             let validator_config_tx = operator_storage.transaction(constants::VALIDATOR_CONFIG)?;
             let validator_config_tx = validator_config_tx.as_signed_user_txn().unwrap().payload();
             let validator_config_tx =
-                if let TransactionPayload::Script(script) = validator_config_tx {
-                    script.clone()
+                if let TransactionPayload::ScriptFunction(script_function) = validator_config_tx {
+                    script_function.clone()
                 } else {
                     return Err(Error::UnexpectedError("Found invalid registration".into()));
                 };
 
-            registrations.push((operator_key, validator_config_tx));
+            registrations.push((
+                operator_key,
+                operator.as_bytes().to_vec(),
+                validator_config_tx,
+            ));
         }
 
         Ok(registrations)
+    }
+
+    /// Retrieves the treasury root key from the remote storage.
+    pub fn treasury_compliance_key(&self, layout: &Layout) -> Result<Ed25519PublicKey, Error> {
+        let config = self.config()?;
+        let storage = config.shared_backend_with_namespace(layout.diem_root.clone());
+        storage.ed25519_key(diem_global_constants::TREASURY_COMPLIANCE_KEY)
     }
 }

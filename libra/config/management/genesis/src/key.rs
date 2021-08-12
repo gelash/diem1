@@ -1,13 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_crypto::ed25519::Ed25519PublicKey;
-use libra_management::{
+use diem_crypto::ed25519::Ed25519PublicKey;
+use diem_management::{
     config::ConfigPath,
     error::Error,
-    secure_backend::{SharedBackend, ValidatorBackend},
+    secure_backend::{SecureBackend, SharedBackend},
 };
+use std::{convert::TryFrom, path::PathBuf, str::FromStr};
 use structopt::StructOpt;
+
+diem_management::secure_backend!(
+    ValidatorBackend,
+    validator_backend,
+    "validator configuration",
+    "path-to-key"
+);
 
 #[derive(Debug, StructOpt)]
 struct Key {
@@ -17,6 +25,8 @@ struct Key {
     shared_backend: SharedBackend,
     #[structopt(flatten)]
     validator_backend: ValidatorBackend,
+    #[structopt(long, help = "ed25519 public key in bcs or hex format")]
+    path_to_key: Option<PathBuf>,
 }
 
 impl Key {
@@ -31,13 +41,19 @@ impl Key {
             .override_shared_backend(&self.shared_backend.shared_backend)?
             .override_validator_backend(&self.validator_backend.validator_backend)?;
 
-        let mut validator_storage = config.validator_backend();
-        let key = validator_storage.ed25519_public_from_private(key_name)?;
+        let key = if let Some(path_to_key) = &self.path_to_key {
+            diem_management::read_key_from_file(path_to_key)
+                .map_err(|e| Error::UnableToReadFile(format!("{:?}", path_to_key), e))?
+        } else {
+            let mut validator_storage = config.validator_backend();
+            let key = validator_storage.ed25519_public_from_private(key_name)?;
 
-        if let Some(account_name) = account_name {
-            let peer_id = libra_types::account_address::from_public_key(&key);
-            validator_storage.set(account_name, peer_id)?;
-        }
+            if let Some(account_name) = account_name {
+                let peer_id = diem_types::account_address::from_public_key(&key);
+                validator_storage.set(account_name, peer_id)?;
+            }
+            key
+        };
 
         let mut shared_storage = config.shared_backend();
         shared_storage.set(key_name, key.clone())?;
@@ -47,15 +63,15 @@ impl Key {
 }
 
 #[derive(Debug, StructOpt)]
-pub struct LibraRootKey {
+pub struct DiemRootKey {
     #[structopt(flatten)]
     key: Key,
 }
 
-impl LibraRootKey {
+impl DiemRootKey {
     pub fn execute(self) -> Result<Ed25519PublicKey, Error> {
         self.key
-            .submit_key(libra_global_constants::LIBRA_ROOT_KEY, None)
+            .submit_key(diem_global_constants::DIEM_ROOT_KEY, None)
     }
 }
 
@@ -68,8 +84,8 @@ pub struct OperatorKey {
 impl OperatorKey {
     pub fn execute(self) -> Result<Ed25519PublicKey, Error> {
         self.key.submit_key(
-            libra_global_constants::OPERATOR_KEY,
-            Some(libra_global_constants::OPERATOR_ACCOUNT),
+            diem_global_constants::OPERATOR_KEY,
+            Some(diem_global_constants::OPERATOR_ACCOUNT),
         )
     }
 }
@@ -82,10 +98,20 @@ pub struct OwnerKey {
 
 impl OwnerKey {
     pub fn execute(self) -> Result<Ed25519PublicKey, Error> {
-        self.key.submit_key(
-            libra_global_constants::OWNER_KEY,
-            Some(libra_global_constants::OWNER_ACCOUNT),
-        )
+        self.key.submit_key(diem_global_constants::OWNER_KEY, None)
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct TreasuryComplianceKey {
+    #[structopt(flatten)]
+    key: Key,
+}
+
+impl TreasuryComplianceKey {
+    pub fn execute(self) -> Result<Ed25519PublicKey, Error> {
+        self.key
+            .submit_key(diem_global_constants::TREASURY_COMPLIANCE_KEY, None)
     }
 }
 
@@ -93,17 +119,17 @@ impl OwnerKey {
 mod tests {
     use super::*;
     use crate::storage_helper::StorageHelper;
-    use libra_secure_storage::{CryptoStorage, KVStorage};
+    use diem_secure_storage::{CryptoStorage, KVStorage};
 
     #[test]
     fn test_owner_key() {
-        test_key(libra_global_constants::OWNER_KEY, StorageHelper::owner_key);
+        test_key(diem_global_constants::OWNER_KEY, StorageHelper::owner_key);
     }
 
     #[test]
     fn test_operator_key() {
         test_key(
-            libra_global_constants::OPERATOR_KEY,
+            diem_global_constants::OPERATOR_KEY,
             StorageHelper::operator_key,
         );
     }
@@ -118,7 +144,7 @@ mod tests {
 
         op(&helper, &local_ns, &remote_ns).unwrap_err();
 
-        helper.initialize(local_ns.clone());
+        helper.initialize_by_idx(local_ns.clone(), 0);
         let local = helper.storage(local_ns.clone());
         let local_key = local.get_public_key(key_name).unwrap().public_key;
 

@@ -1,9 +1,7 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_management::{
-    config::ConfigPath, constants, error::Error, secure_backend::SharedBackend,
-};
+use diem_management::{config::ConfigPath, constants, error::Error, secure_backend::SharedBackend};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -19,7 +17,8 @@ use structopt::StructOpt;
 pub struct Layout {
     pub operators: Vec<String>,
     pub owners: Vec<String>,
-    pub libra_root: Vec<String>,
+    pub diem_root: String,
+    pub treasury_compliance: String,
 }
 
 impl Layout {
@@ -65,7 +64,7 @@ impl SetLayout {
             .config
             .load()?
             .override_shared_backend(&self.backend.shared_backend)?;
-        let mut storage = config.shared_backend();
+        let mut storage = config.shared_backend_with_namespace(constants::COMMON_NS.to_string());
         storage.set(constants::LAYOUT, data)?;
 
         Ok(layout)
@@ -81,7 +80,8 @@ mod tests {
         let contents = "\
             operators = [\"alice\", \"bob\"]\n\
             owners = [\"carol\"]\n\
-            libra_root = [\"dave\"]\n\
+            diem_root = \"dave\"\n\
+            treasury_compliance = \"other_dave\"\n\
         ";
 
         let layout = Layout::parse(contents).unwrap();
@@ -90,6 +90,7 @@ mod tests {
             vec!["alice".to_string(), "bob".to_string()]
         );
         assert_eq!(layout.owners, vec!["carol".to_string()]);
-        assert_eq!(layout.libra_root, vec!["dave".to_string()]);
+        assert_eq!(layout.diem_root, "dave");
+        assert_eq!(layout.treasury_compliance, "other_dave");
     }
 }

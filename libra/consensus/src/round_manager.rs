@@ -1,14 +1,19 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    block_storage::{BlockReader, BlockRetriever, BlockStore},
+    block_storage::{
+        tracing::{observe_block, BlockStage},
+        BlockReader, BlockRetriever, BlockStore,
+    },
     counters,
+    error::VerifyError,
     liveness::{
         proposal_generator::ProposalGenerator,
         proposer_election::ProposerElection,
         round_state::{NewRoundEvent, NewRoundReason, RoundState},
     },
+    logging::{LogEvent, LogSchema},
     metrics_safety_rules::MetricsSafetyRules,
     network::{IncomingBlockRetrievalRequest, NetworkSender},
     network_interface::ConsensusMsg,
@@ -28,11 +33,10 @@ use consensus_types::{
     vote::Vote,
     vote_msg::VoteMsg,
 };
+use diem_infallible::checked;
+use diem_logger::prelude::*;
+use diem_types::{epoch_state::EpochState, validator_verifier::ValidatorVerifier};
 use fail::fail_point;
-use libra_logger::prelude::*;
-use libra_time::duration_since_epoch;
-use libra_trace::prelude::*;
-use libra_types::{epoch_state::EpochState, validator_verifier::ValidatorVerifier};
 #[cfg(test)]
 use safety_rules::ConsensusState;
 use safety_rules::TSafetyRules;
@@ -48,7 +52,7 @@ pub enum UnverifiedEvent {
 }
 
 impl UnverifiedEvent {
-    pub fn verify(self, validator: &ValidatorVerifier) -> Result<VerifiedEvent> {
+    pub fn verify(self, validator: &ValidatorVerifier) -> Result<VerifiedEvent, VerifyError> {
         Ok(match self {
             UnverifiedEvent::ProposalMsg(p) => {
                 p.verify(validator)?;
@@ -142,7 +146,9 @@ impl RecoveryManager {
     }
 
     pub async fn sync_up(&mut self, sync_info: &SyncInfo, peer: Author) -> Result<RecoveryData> {
-        sync_info.verify(&self.epoch_state.verifier)?;
+        sync_info
+            .verify(&self.epoch_state.verifier)
+            .map_err(VerifyError::from)?;
         ensure!(
             sync_info.highest_round() > self.last_committed_round,
             "[RecoveryManager] Received sync info has lower round number than committed block"
@@ -199,6 +205,9 @@ impl RoundManager {
         storage: Arc<dyn PersistentLivenessStorage>,
         sync_only: bool,
     ) -> Self {
+        counters::OP_COUNTERS
+            .gauge("sync_only")
+            .set(sync_only as i64);
         Self {
             epoch_state,
             block_store,
@@ -206,8 +215,8 @@ impl RoundManager {
             proposer_election,
             proposal_generator,
             safety_rules,
-            txn_manager,
             network,
+            txn_manager,
             storage,
             sync_only,
         }
@@ -233,7 +242,6 @@ impl RoundManager {
         &mut self,
         new_round_event: NewRoundEvent,
     ) -> anyhow::Result<()> {
-        debug!("Processing {}", new_round_event);
         counters::CURRENT_ROUND.set(new_round_event.round as i64);
         counters::ROUND_TIMEOUT_MS.set(new_round_event.timeout.as_millis() as i64);
         match new_round_event.reason {
@@ -244,6 +252,10 @@ impl RoundManager {
                 counters::TIMEOUT_ROUNDS_COUNT.inc();
             }
         };
+        debug!(
+            self.new_log(LogEvent::NewRound),
+            reason = new_round_event.reason
+        );
         if self
             .proposer_election
             .is_valid_proposer(self.proposal_generator.author(), new_round_event.round)
@@ -267,10 +279,8 @@ impl RoundManager {
             .generate_proposal(new_round_event.round)
             .await?;
         let signed_proposal = self.safety_rules.sign_proposal(proposal)?;
-        self.txn_manager.trace_transactions(&signed_proposal);
-        trace_edge!("parent_proposal", {"block", signed_proposal.parent_id()}, {"block", signed_proposal.id()});
-        trace_event!("round_manager::generate_proposal", {"block", signed_proposal.id()});
-        debug!("Propose {}", signed_proposal);
+        observe_block(signed_proposal.timestamp_usecs(), BlockStage::SIGNED);
+        debug!(self.new_log(LogEvent::Propose), "{}", signed_proposal);
         // return proposal
         Ok(ProposalMsg::new(
             signed_proposal,
@@ -282,7 +292,14 @@ impl RoundManager {
     /// 1. ensure after processing sync info, we're at the same round as the proposal
     /// 2. execute and decide whether to vode for the proposal
     pub async fn process_proposal_msg(&mut self, proposal_msg: ProposalMsg) -> anyhow::Result<()> {
-        trace_event!("round_manager::pre_process_proposal", {"block", proposal_msg.proposal().id()});
+        fail_point!("consensus::process_proposal_msg", |_| {
+            Err(anyhow::anyhow!("Injected error in process_proposal_msg"))
+        });
+
+        observe_block(
+            proposal_msg.proposal().timestamp_usecs(),
+            BlockStage::RECEIVED,
+        );
         if self
             .ensure_round_and_sync_up(
                 proposal_msg.proposal().round(),
@@ -315,29 +332,28 @@ impl RoundManager {
         if help_remote && local_sync_info.has_newer_certificates(&sync_info) {
             counters::SYNC_INFO_MSGS_SENT_COUNT.inc();
             debug!(
-                "Peer {} has stale state {}, send it back {}",
-                author.short_str(),
-                sync_info,
-                local_sync_info,
+                self.new_log(LogEvent::HelpPeerSync).remote_peer(author),
+                "Remote peer has stale state {}, send it back {}", sync_info, local_sync_info,
             );
             self.network.send_sync_info(local_sync_info.clone(), author);
         }
         if sync_info.has_newer_certificates(&local_sync_info) {
             debug!(
-                "Local state {} is stale than peer {} remote state {}",
-                local_sync_info,
-                author.short_str(),
-                sync_info
+                self.new_log(LogEvent::SyncToPeer).remote_peer(author),
+                "Local state {} is stale than remote state {}", local_sync_info, sync_info
             );
             // Some information in SyncInfo is ahead of what we have locally.
             // First verify the SyncInfo (didn't verify it in the yet).
             sync_info
                 .verify(&self.epoch_state().verifier)
                 .map_err(|e| {
-                    sl_error!(security_log(security_events::INVALID_SYNC_INFO_MSG)
-                        .data("sync_info", &sync_info)
-                        .data_display("error", &e));
-                    e
+                    error!(
+                        SecurityEvent::InvalidSyncInfoMsg,
+                        sync_info = sync_info,
+                        remote_peer = author,
+                        error = ?e,
+                    );
+                    VerifyError::from(e)
                 })?;
             let result = self
                 .block_store
@@ -383,11 +399,22 @@ impl RoundManager {
         sync_info: SyncInfo,
         peer: Author,
     ) -> anyhow::Result<()> {
-        debug!("Received a sync info msg: {}", sync_info);
+        fail_point!("consensus::process_sync_info_msg", |_| {
+            Err(anyhow::anyhow!("Injected error in process_sync_info_msg"))
+        });
+        debug!(
+            self.new_log(LogEvent::ReceiveSyncInfo).remote_peer(peer),
+            "{}", sync_info
+        );
         // To avoid a ping-pong cycle between two peers that move forward together.
-        self.ensure_round_and_sync_up(sync_info.highest_round() + 1, &sync_info, peer, false)
-            .await
-            .context("[RoundManager] Failed to process sync info msg")?;
+        self.ensure_round_and_sync_up(
+            checked!((sync_info.highest_round()) + 1)?,
+            &sync_info,
+            peer,
+            false,
+        )
+        .await
+        .context("[RoundManager] Failed to process sync info msg")?;
         Ok(())
     }
 
@@ -418,7 +445,10 @@ impl RoundManager {
             _ => {
                 // Didn't vote in this round yet, generate a backup vote
                 let nil_block = self.proposal_generator.generate_nil_block(round)?;
-                debug!("Planning to vote for a NIL block {}", nil_block);
+                debug!(
+                    self.new_log(LogEvent::VoteNIL),
+                    "Planning to vote for a NIL block {}", nil_block
+                );
                 counters::VOTE_NIL_COUNT.inc();
                 let nil_vote = self.execute_and_vote(nil_block).await?;
                 (false, nil_vote)
@@ -440,12 +470,13 @@ impl RoundManager {
             self.block_store.sync_info(),
         )));
         self.network.broadcast(timeout_vote_msg).await;
-        bail!(
-            "Round {} timed out: {}, expected round proposer was {:?}, broadcasted the vote to all replicas",
-            round,
-            if use_last_vote { "already executed and voted at this round" } else { "generate a backup vote" },
-            self.proposer_election.get_valid_proposer(round),
+        error!(
+            round = round,
+            remote_peer = self.proposer_election.get_valid_proposer(round),
+            voted = use_last_vote,
+            event = LogEvent::Timeout,
         );
+        bail!("Round {} timeout, broadcast to all peers", round);
     }
 
     /// This function is called only after all the dependencies of the given QC have been retrieved.
@@ -464,15 +495,20 @@ impl RoundManager {
     /// 4. In case a validator chooses to vote, send the vote to the representatives at the next
     /// round.
     async fn process_proposal(&mut self, proposal: Block) -> Result<()> {
-        fail_point!("process_proposal", |_| {
-            Err(anyhow::anyhow!("Injected error in process_proposal"))
-        });
+        let author = proposal
+            .author()
+            .expect("Proposal should be verified having an author");
+
+        info!(
+            self.new_log(LogEvent::ReceiveProposal).remote_peer(author),
+            block_hash = proposal.id(),
+            block_parent_hash = proposal.quorum_cert().certified_block().id(),
+        );
+
         ensure!(
             self.proposer_election.is_valid_proposal(&proposal),
             "[RoundManager] Proposer {} for block {} is not a valid proposer for this round",
-            proposal
-                .author()
-                .expect("Proposal should be verified having an author"),
+            author,
             proposal,
         );
 
@@ -486,14 +522,9 @@ impl RoundManager {
             self.round_state.current_round_deadline(),
         );
 
-        debug!("RoundManager: process_proposed_block {}", proposal);
-
-        if let Some(time_to_receival) = duration_since_epoch().checked_sub(block_time_since_epoch) {
-            counters::CREATION_TO_RECEIVAL_S.observe_duration(time_to_receival);
-        }
+        observe_block(proposal.timestamp_usecs(), BlockStage::SYNCED);
 
         let proposal_round = proposal.round();
-
         let vote = self
             .execute_and_vote(proposal)
             .await
@@ -502,7 +533,7 @@ impl RoundManager {
         let recipients = self
             .proposer_election
             .get_valid_proposer(proposal_round + 1);
-        debug!("{}Voted: {} {}", Fg(Green), Fg(Reset), vote);
+        debug!(self.new_log(LogEvent::Vote).remote_peer(author), "{}", vote);
 
         self.round_state.record_vote(vote.clone());
         let vote_msg = VoteMsg::new(vote, self.block_store.sync_info());
@@ -516,7 +547,6 @@ impl RoundManager {
     /// * save the updated state to consensus DB
     /// * return a VoteMsg with the LedgerInfo to be committed in case the vote gathers QC.
     async fn execute_and_vote(&mut self, proposed_block: Block) -> anyhow::Result<Vote> {
-        trace_code_block!("round_manager::execute_and_vote", {"block", proposed_block.id()});
         let executed_block = self
             .block_store
             .execute_and_insert_block(proposed_block)
@@ -529,8 +559,7 @@ impl RoundManager {
             .await
         {
             error!(
-                "[RoundManager] Failed to notify mempool of rejected txns: {:?}",
-                e
+                error = ?e, "[RoundManager] Failed to notify mempool of rejected txns",
             );
         }
 
@@ -556,6 +585,7 @@ impl RoundManager {
                 Fg(Reset),
                 executed_block.block()
             ))?;
+        observe_block(executed_block.block().timestamp_usecs(), BlockStage::VOTED);
 
         self.storage
             .save_vote(&vote)
@@ -571,7 +601,9 @@ impl RoundManager {
     /// 2. Add the vote to the pending votes and check whether it finishes a QC.
     /// 3. Once the QC/TC successfully formed, notify the RoundState.
     pub async fn process_vote_msg(&mut self, vote_msg: VoteMsg) -> anyhow::Result<()> {
-        trace_code_block!("round_manager::process_vote", {"block", vote_msg.proposed_block_id()});
+        fail_point!("consensus::process_vote_msg", |_| {
+            Err(anyhow::anyhow!("Injected error in process_vote_msg"))
+        });
         // Check whether this validator is a valid recipient of the vote.
         if self
             .ensure_round_and_sync_up(
@@ -595,9 +627,21 @@ impl RoundManager {
     /// 1) fetch missing dependencies if required, and then
     /// 2) call process_certificates(), which will start a new round in return.
     async fn process_vote(&mut self, vote: &Vote) -> anyhow::Result<()> {
+        let round = vote.vote_data().proposed().round();
+
+        info!(
+            self.new_log(LogEvent::ReceiveVote)
+                .remote_peer(vote.author()),
+            vote = %vote,
+            vote_epoch = vote.vote_data().proposed().epoch(),
+            vote_round = vote.vote_data().proposed().round(),
+            vote_id = vote.vote_data().proposed().id(),
+            vote_state = vote.vote_data().proposed().executed_state_id(),
+        );
+
         if !vote.is_timeout() {
             // Unlike timeout votes regular votes are sent to the leaders of the next round only.
-            let next_round = vote.vote_data().proposed().round() + 1;
+            let next_round = round + 1;
             ensure!(
                 self.proposer_election
                     .is_valid_proposer(self.proposal_generator.author(), next_round),
@@ -606,7 +650,6 @@ impl RoundManager {
                 next_round
             );
         }
-        debug!("Add vote: {}", vote);
         let block_id = vote.vote_data().proposed().id();
         // Check if the block already had a QC
         if self
@@ -622,15 +665,6 @@ impl RoundManager {
             .insert_vote(vote, &self.epoch_state.verifier)
         {
             VoteReceptionResult::NewQuorumCertificate(qc) => {
-                // Note that the block might not be present locally, in which case we cannot calculate
-                // time between block creation and qc
-                if let Some(time_to_qc) = self.block_store.get_block(block_id).and_then(|block| {
-                    duration_since_epoch()
-                        .checked_sub(Duration::from_micros(block.timestamp_usecs()))
-                }) {
-                    counters::CREATION_TO_QC_S.observe_duration(time_to_qc);
-                }
-
                 self.new_qc_aggregated(qc, vote.author()).await
             }
             VoteReceptionResult::NewTimeoutCertificate(tc) => self.new_tc_aggregated(tc).await,
@@ -643,6 +677,10 @@ impl RoundManager {
         qc: Arc<QuorumCert>,
         preferred_peer: Author,
     ) -> anyhow::Result<()> {
+        observe_block(
+            qc.certified_block().timestamp_usecs(),
+            BlockStage::QC_AGGREGATED,
+        );
         let result = self
             .block_store
             .insert_quorum_cert(&qc, &mut self.create_block_retriever(preferred_peer))
@@ -671,6 +709,9 @@ impl RoundManager {
         &self,
         request: IncomingBlockRetrievalRequest,
     ) -> anyhow::Result<()> {
+        fail_point!("consensus::process_block_retrieval", |_| {
+            Err(anyhow::anyhow!("Injected error in process_block_retrieval"))
+        });
         let mut blocks = vec![];
         let mut status = BlockRetrievalStatus::Succeeded;
         let mut id = request.req.block_id();
@@ -689,12 +730,12 @@ impl RoundManager {
         }
 
         let response = Box::new(BlockRetrievalResponse::new(status, blocks));
-        lcs::to_bytes(&ConsensusMsg::BlockRetrievalResponse(response))
+        bcs::to_bytes(&ConsensusMsg::BlockRetrievalResponse(response))
             .and_then(|bytes| {
                 request
                     .response_sender
                     .send(Ok(bytes.into()))
-                    .map_err(|e| lcs::Error::Custom(format!("{:?}", e)))
+                    .map_err(|e| bcs::Error::Custom(format!("{:?}", e)))
             })
             .context("[RoundManager] Failed to process block retrieval")
     }
@@ -709,7 +750,7 @@ impl RoundManager {
             self.round_state.record_vote(vote);
         }
         if let Err(e) = self.process_new_round_event(new_round_event).await {
-            error!("[RoundManager] Error during start: {:?}", e);
+            error!(error = ?e, "[RoundManager] Error during start");
         }
     }
 
@@ -730,5 +771,11 @@ impl RoundManager {
 
     pub fn round_state(&self) -> &RoundState {
         &self.round_state
+    }
+
+    fn new_log(&self, event: LogEvent) -> LogSchema {
+        LogSchema::new(event)
+            .round(self.round_state.current_round())
+            .epoch(self.epoch_state.epoch)
     }
 }

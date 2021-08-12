@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -13,7 +13,8 @@ use crate::{
     validator_verifier::{random_validator_verifier, ValidatorConsensusInfo, ValidatorVerifier},
     waypoint::Waypoint,
 };
-use libra_crypto::{ed25519::Ed25519Signature, hash::HashValue};
+use bcs::test_helpers::assert_canonical_encode_decode;
+use diem_crypto::{ed25519::Ed25519Signature, hash::HashValue};
 use proptest::{
     collection::{size_range, vec, SizeRange},
     prelude::*,
@@ -215,6 +216,11 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     #[test]
+    fn test_trusted_state_roundtrip_canonical_serialization(trusted_state in any::<TrustedState>()) {
+        assert_canonical_encode_decode(trusted_state);
+    }
+
+    #[test]
     fn test_ratchet_from(
         (_vsets, lis_with_sigs, latest_li) in arb_update_proof(
             10,   /* start epoch */
@@ -245,7 +251,7 @@ proptest! {
                 new_state,
                 latest_epoch_change_li,
             } => {
-                assert_eq!(new_state.latest_version(), expected_latest_version);
+                assert_eq!(new_state.version(), expected_latest_version);
                 assert_eq!(Some(latest_epoch_change_li), expected_latest_epoch_change_li.as_ref());
                 assert_eq!(latest_epoch_change_li.ledger_info().next_epoch_state(), expected_validator_set);
             }
@@ -280,9 +286,9 @@ proptest! {
             TrustedStateChange::Version {
                 new_state,
             } => {
-                assert_eq!(new_state.latest_version(), expected_latest_version);
+                assert_eq!(new_state.version(), expected_latest_version);
             }
-            TrustedStateChange::NoChange => assert_eq!(trusted_state.latest_version(), expected_latest_version),
+            TrustedStateChange::NoChange => assert_eq!(trusted_state.version(), expected_latest_version),
         };
     }
 
@@ -320,14 +326,14 @@ proptest! {
                 new_state,
                 latest_epoch_change_li,
             } => {
-                assert_eq!(new_state.latest_version(), expected_latest_version);
+                assert_eq!(new_state.version(), expected_latest_version);
                 assert_eq!(Some(latest_epoch_change_li), expected_latest_epoch_change_li.as_ref());
                 assert_eq!(latest_epoch_change_li.ledger_info().next_epoch_state(), expected_validator_set);
             }
             TrustedStateChange::Version {
                 new_state,
             } => {
-                assert_eq!(new_state.latest_version(), expected_latest_version);
+                assert_eq!(new_state.version(), expected_latest_version);
             }
             _ => (),
         };
@@ -339,7 +345,7 @@ proptest! {
             1,    /* start epoch */
             1,    /* start version */
             3,    /* version delta */
-            2..5, /* epoch changes */
+            3..6, /* epoch changes */
             1..3, /* validators per epoch */
         ),
         li_gap_idx in any::<Index>(),
@@ -349,13 +355,63 @@ proptest! {
         let trusted_state = TrustedState::try_from(initial_li).unwrap();
 
         // materialize index and remove an epoch change in the proof to add a gap
-        let li_gap_idx = li_gap_idx.index(lis_with_sigs.len());
+        let li_gap_idx = li_gap_idx.index(lis_with_sigs.len() - 1);
         lis_with_sigs.remove(li_gap_idx);
 
         let change_proof = EpochChangeProof::new(lis_with_sigs, false /* more */);
         trusted_state
             .verify_and_ratchet(&latest_li, &change_proof)
             .expect_err("Should always return Err with an invalid change proof");
+    }
+
+    #[test]
+    fn test_ratchet_succeeds_with_more(
+        (_vsets, mut lis_with_sigs, latest_li) in arb_update_proof(
+            1,    /* start epoch */
+            1,    /* start version */
+            3,    /* version delta */
+            3..6, /* epoch changes */
+            1..3, /* validators per epoch */
+        ),
+    ) {
+        let initial_li_with_sigs = lis_with_sigs.remove(0);
+        let initial_li = initial_li_with_sigs.ledger_info();
+        let trusted_state = TrustedState::try_from(initial_li).unwrap();
+
+        // remove the last LI from the proof
+        lis_with_sigs.pop();
+
+        let expected_latest_epoch_change_li = lis_with_sigs.last().cloned();
+        let expected_latest_version = expected_latest_epoch_change_li
+            .as_ref()
+            .unwrap()
+            .ledger_info()
+            .version();
+        let expected_validator_set = expected_latest_epoch_change_li
+            .as_ref()
+            .and_then(|li_with_sigs| li_with_sigs.ledger_info().next_epoch_state());
+
+        let mut change_proof = EpochChangeProof::new(lis_with_sigs, false /* more */);
+        trusted_state
+            .verify_and_ratchet(&latest_li, &change_proof)
+            .expect_err("Should return Err when more is false and there's a gap");
+
+        change_proof.more = true;
+        let trusted_state_change = trusted_state
+            .verify_and_ratchet(&latest_li, &change_proof)
+            .expect("Should succeed with more in EpochChangeProof");
+
+        match trusted_state_change {
+            TrustedStateChange::Epoch {
+                new_state,
+                latest_epoch_change_li,
+            } => {
+                assert_eq!(new_state.version(), expected_latest_version);
+                assert_eq!(Some(latest_epoch_change_li), expected_latest_epoch_change_li.as_ref());
+                assert_eq!(latest_epoch_change_li.ledger_info().next_epoch_state(), expected_validator_set);
+            }
+            _ => panic!("Unexpected ratchet result"),
+        };
     }
 
     #[test]
@@ -403,7 +459,7 @@ proptest! {
         let good_li = latest_li.ledger_info();
         let change_proof = EpochChangeProof::new(lis_with_sigs, false /* more */);
 
-        if good_li.version() == trusted_state.latest_version() {
+        if good_li.version() == trusted_state.version() {
             // Verifying a latest ledger info (inside the last epoch) with
             // invalid data should fail.
             let bad_li = LedgerInfoWithSignatures::new(

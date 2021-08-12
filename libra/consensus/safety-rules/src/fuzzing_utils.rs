@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::serializer::SafetyRulesInput;
@@ -10,11 +10,13 @@ use consensus_types::{
     vote_data::VoteData,
     vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
-use libra_crypto::{
-    ed25519::{Ed25519PublicKey, Ed25519Signature},
+use diem_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     hash::{HashValue, TransactionAccumulatorHasher},
+    test_utils::TEST_SEED,
+    traits::{SigningKey, Uniform},
 };
-use libra_types::{
+use diem_types::{
     account_address::AccountAddress,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
@@ -25,7 +27,7 @@ use libra_types::{
     validator_verifier::{ValidatorConsensusInfo, ValidatorVerifier},
 };
 use proptest::prelude::*;
-use std::convert::TryFrom;
+use rand::{rngs::StdRng, SeedableRng};
 
 const MAX_BLOCK_SIZE: usize = 10000;
 const MAX_NUM_ADDR_TO_VALIDATOR_INFO: usize = 10;
@@ -57,8 +59,16 @@ prop_compose! {
     )(
         id in any::<HashValue>(),
         block_data in arb_block_data(),
-        signature in arb_ed25519_signature(),
+        include_signature in any::<bool>(),
     ) -> Block {
+        let signature = if include_signature {
+            let mut rng = StdRng::from_seed(TEST_SEED);
+            let private_key = Ed25519PrivateKey::generate(&mut rng);
+            let signature = private_key.sign(&block_data);
+            Some(signature)
+        } else {
+            None
+        };
         Block::new_for_testing(id, block_data, signature)
     }
 }
@@ -95,9 +105,21 @@ prop_compose! {
 prop_compose! {
     pub fn arb_maybe_signed_vote_proposal(
     )(
-        signature in arb_ed25519_signature(),
-        vote_proposal in arb_vote_proposal(),
+        accumulator_extension_proof in arb_accumulator_extension_proof(),
+        block in arb_block(),
+        next_epoch_state in arb_epoch_state(),
+        include_signature in any::<bool>(),
     ) -> MaybeSignedVoteProposal {
+        let vote_proposal = VoteProposal::new(accumulator_extension_proof, block, next_epoch_state);
+        let signature = if include_signature {
+            let mut rng = StdRng::from_seed(TEST_SEED);
+            let private_key = Ed25519PrivateKey::generate(&mut rng);
+            let signature = private_key.sign(&vote_proposal);
+            Some(signature)
+        } else {
+            None
+        };
+
         MaybeSignedVoteProposal {
             vote_proposal,
             signature
@@ -130,25 +152,6 @@ prop_compose! {
         round in any::<u64>(),
     ) -> Timeout {
         Timeout::new(epoch, round)
-    }
-}
-
-// This generates an arbitrary and optional Ed25519Signature.
-prop_compose! {
-    pub fn arb_ed25519_signature(
-    )(
-        include_signature in any::<bool>(),
-        signature_bytes in prop::collection::vec(any::<u8>(), 0..Ed25519Signature::LENGTH),
-    ) -> Option<Ed25519Signature> {
-        if include_signature {
-            if let Ok(signature) = Ed25519Signature::try_from(signature_bytes.as_slice()) {
-                Some(signature)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     }
 }
 
@@ -219,18 +222,6 @@ prop_compose! {
     }
 }
 
-// This generates an arbitrary VoteProposal.
-prop_compose! {
-    pub fn arb_vote_proposal(
-    )(
-        accumulator_extension_proof in arb_accumulator_extension_proof(),
-        block in arb_block(),
-        next_epoch_state in arb_epoch_state()
-    ) -> VoteProposal {
-        VoteProposal::new(accumulator_extension_proof, block, next_epoch_state)
-    }
-}
-
 // This generates an arbitrary BlockType enum.
 fn arb_block_type() -> impl Strategy<Value = BlockType> {
     prop_oneof![
@@ -259,11 +250,11 @@ pub mod fuzzing {
         block::Block, block_data::BlockData, timeout::Timeout, vote::Vote,
         vote_proposal::MaybeSignedVoteProposal,
     };
-    use libra_crypto::ed25519::Ed25519Signature;
-    use libra_types::epoch_change::EpochChangeProof;
+    use diem_crypto::ed25519::Ed25519Signature;
+    use diem_types::epoch_change::EpochChangeProof;
 
     pub fn fuzz_initialize(proof: EpochChangeProof) -> Result<(), Error> {
-        let mut safety_rules = test_utils::test_safety_rules();
+        let mut safety_rules = test_utils::test_safety_rules_uninitialized();
         safety_rules.initialize(&proof)
     }
 
@@ -278,8 +269,8 @@ pub mod fuzzing {
         // Create a safety rules serializer test instance for fuzzing
         let mut serializer_service = test_utils::test_serializer();
 
-        // LCS encode the safety_rules_input and fuzz the handle_message() method
-        if let Ok(safety_rules_input) = lcs::to_bytes(&safety_rules_input) {
+        // BCS encode the safety_rules_input and fuzz the handle_message() method
+        if let Ok(safety_rules_input) = bcs::to_bytes(&safety_rules_input) {
             serializer_service.handle_message(safety_rules_input)
         } else {
             Err(Error::SerializationError(
