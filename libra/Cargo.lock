@@ -2448,7 +2448,9 @@ name = "diem-vm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bcs",
+ "crossbeam",
  "crossbeam-queue",
  "dashmap 4.0.2",
  "diem-crypto",
