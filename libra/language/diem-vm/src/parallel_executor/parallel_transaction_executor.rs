@@ -200,6 +200,7 @@ impl ParallelTransactionExecutor {
         let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
 
+        let thread_ids = AtomicUsize::new(0);
         scope(|s| {
             println!(
                 "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}, prob_of_each_txn_to_drop {}, percentage_of_each_txn_to_drop {}",
@@ -209,8 +210,10 @@ impl ParallelTransactionExecutor {
                 prob_of_each_txn_to_drop,
                 percentage_of_each_txn_to_drop,
             );
-            for thread_id in 0..(compute_threads) {
+            for _ in 0..(compute_threads) {
+                thread_ids.fetch_add(1, Ordering::SeqCst);
                 s.spawn(|_| {
+                    let thread_id = thread_ids.load(Ordering::SeqCst)-1;
                     let scheduler = Arc::clone(&scheduler);
                     // Make a new VM per thread -- with its own module cache
                     let thread_vm = DiemVM::new(base_view);
