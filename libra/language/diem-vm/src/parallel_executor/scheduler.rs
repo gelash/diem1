@@ -168,7 +168,7 @@ impl Scheduler {
             Arc::new(STMStatus::new_before_execution(cur_status.retry_num() + 1)),
         );
 
-        if Arc::ptr_eq(&stored_ptr, cur_status) {
+        if !Arc::ptr_eq(&stored_ptr, cur_status) {
             // The corresponding re-execution was already aborted, nothing to do.
             return false;
         }
