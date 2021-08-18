@@ -9,6 +9,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
+#[derive(Clone)]
 pub struct ReadDescriptor {
     access_path: AccessPath,
 
@@ -76,17 +77,17 @@ impl STMStatus {
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner Vec.
     pub fn read_set(&self) -> &Vec<ReadDescriptor> {
-        &self.input_output.unwrap().0
+        &self.input_output.as_ref().unwrap().0
     }
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
     pub fn write_set(&self) -> &WriteSet {
-        let output = &self.input_output.unwrap().1;
-        output.1.write_set()
+        let output = &self.input_output.as_ref().unwrap().1;
+        &output.1.write_set()
     }
 
     pub fn output(&self) -> (VMStatus, TransactionOutput) {
-        self.input_output.unwrap().1
+        self.input_output.as_ref().unwrap().1.clone()
     }
 }
 

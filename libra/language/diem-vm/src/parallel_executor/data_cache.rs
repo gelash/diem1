@@ -23,6 +23,7 @@ use std::{
     convert::AsRef,
     thread,
     time::Duration,
+    sync::{Arc, RwLock},
 };
 
 pub struct VersionedDataCache(MultiVersionHashMap<AccessPath, Vec<u8>>);
@@ -31,13 +32,13 @@ pub struct VersionedStateView<'view> {
     version: usize,
     base_view: &'view dyn StateView,
     placeholder: &'view VersionedDataCache,
-    reads: HashMap<
+    reads: Arc<RwLock<HashMap<
         AccessPath,
         (
             Option<(usize, usize)>,
             PartialVMResult<Option<Cow<'view, [u8]>>>,
         ),
-    >,
+    >>>,
 }
 
 const ONE_MILLISEC: Duration = Duration::from_millis(10);
@@ -162,13 +163,13 @@ impl<'view> VersionedStateView<'view> {
             version,
             base_view,
             placeholder,
-            reads: HashMap::new(),
+            reads: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor> {
-        self.reads
+        self.reads.write().unwrap()
             .drain()
             .map(|(path, (version_and_retry_num, _))| {
                 ReadDescriptor::new(path, version_and_retry_num)
@@ -205,7 +206,7 @@ impl<'view> VersionedStateView<'view> {
     fn get_bytes_ref(&self, access_path: &AccessPath) -> PartialVMResult<Option<Cow<[u8]>>> {
         let mut loop_iterations = 0;
         loop {
-            if let Some((_, ret)) = self.reads.get(access_path) {
+            if let Some((_, ret)) = self.reads.read().unwrap().get(access_path) {
                 return ret.clone();
             }
 
@@ -218,14 +219,14 @@ impl<'view> VersionedStateView<'view> {
                     .get(access_path)
                     .map(|opt| opt.map(Cow::from))
                     .map_err(|_| PartialVMError::new(StatusCode::STORAGE_ERROR));
-                self.reads.insert(access_path.clone(), (None, ret.clone()));
+                self.reads.write().unwrap().insert(access_path.clone(), (None, ret.clone()));
                 return ret.clone();
             }
 
             // Read is a success
             if let Ok((data, version, retry_num)) = read {
                 let ret = Ok(data.map(Cow::from));
-                self.reads.insert(
+                self.reads.write().unwrap().insert(
                     access_path.clone(),
                     (Some((version, retry_num)), ret.clone()),
                 );
