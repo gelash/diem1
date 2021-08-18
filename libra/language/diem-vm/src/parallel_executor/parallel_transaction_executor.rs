@@ -175,12 +175,12 @@ impl ParallelTransactionExecutor {
         let mut ones_mask = 1;
         // Set a bit to the left until compute_threads covered by the mask.
         while ones_mask < compute_threads {
-            ones_mask = (ones_mask << 1) & 1;
+            ones_mask = (ones_mask << 1) | 1;
         }
         // Threads mask is used to decide when each thread performs an expensive check whether
         // the execution is completed (all transactions can be committed from STM prospective).
         // Appending 4 1's to the right ensures the check happens once every 16 iterations.
-        let threads_mask = (ones_mask << 4) & 15;
+        let threads_mask = (ones_mask << 4) | 15;
 
         let scheduler = Arc::new(Scheduler::new(num_txns, compute_threads));
 
@@ -274,7 +274,6 @@ impl ParallelTransactionExecutor {
                                     // Someone already aborted, continue to the work loop.
                                     continue;
                                 }
-
                                 // Set dirty in both static and dynamic mvhashmaps.
                                 let write_timer = Instant::now();
                                 versioned_data_cache.mark_dirty(
@@ -299,7 +298,6 @@ impl ParallelTransactionExecutor {
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
                             version_to_execute = scheduler.next_txn_to_execute();
-
                             if version_to_execute.is_none() {
                                 // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
                                 // core to take resources and better HT.
@@ -382,6 +380,7 @@ impl ParallelTransactionExecutor {
                                 panic!("TODO STOP VM & RETURN ERROR");
                             }
                         }
+
                         local_apply_write_time += local_timer.elapsed();
                         local_timer = Instant::now();
                     }

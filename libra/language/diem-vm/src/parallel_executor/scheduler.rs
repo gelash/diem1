@@ -120,7 +120,7 @@ impl Scheduler {
             execution_marker: AtomicUsize::new(0),
             validation_marker: AtomicU64::new(0),
             thread_commit_markers: (0..num_threads)
-                .map(|_| CachePadded::new(AtomicUsize::new(0)))
+                .map(|_| CachePadded::new(AtomicUsize::new(usize::MAX)))
                 .collect(),
             done_marker: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
@@ -148,7 +148,7 @@ impl Scheduler {
 
             let new_num_decrease = (val_marker & (1 << 32 - 1)) + 1;
             // TODO: assert no overflow.
-            let new_marker = ((target_version << 32) as u64) & new_num_decrease;
+            let new_marker = ((target_version << 32) as u64) | new_num_decrease;
 
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
@@ -184,14 +184,17 @@ impl Scheduler {
             let val_marker = self.validation_marker.load(Ordering::Acquire); // status read below.
 
             let next_to_val = (val_marker >> 32) as usize;
+            if next_to_val >= self.num_txn_to_execute() {
+                return None;
+            }
             let next_status = self.txn_status[next_to_val].load_full();
-            if next_to_val >= self.num_txn_to_execute() || !next_status.executed() {
+            if !next_status.executed() {
                 // No more transactions or next txn not yet (re-)executed to validate.
                 return None;
             }
 
             let num_decrease = val_marker & (1 << 32 - 1);
-            let new_marker = ((next_to_val as u64 + 1) << 32) & num_decrease;
+            let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
                 new_marker,
