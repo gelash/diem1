@@ -128,8 +128,8 @@ impl ParallelTransactionExecutor {
         // let mut rng = rand::thread_rng(); // randomness
         // let prob_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         // let percentage_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
-        let prob_of_each_txn_to_drop = 1.0;
-        let percentage_of_each_txn_to_drop = 1.0;
+        let prob_of_each_txn_to_drop = 0.0;
+        let percentage_of_each_txn_to_drop = 0.0;
         // Randomly drop some estimated writeset of some transaction
         let infer_result = self.hack_infer_results(
             prob_of_each_txn_to_drop,
@@ -258,6 +258,7 @@ impl ParallelTransactionExecutor {
                             });
                             local_validation_read_time += read_timer.elapsed();
 
+                            println!("validation txn {}, valid {}", version_to_validate, valid);
                             if valid {
                                 scheduler.finish_validation(thread_id);
 
@@ -268,12 +269,14 @@ impl ParallelTransactionExecutor {
                                 continue;
                             } else {
                                 if !scheduler.abort(version_to_validate, &status_to_validate) {
+                                    scheduler.finish_validation(thread_id);
                                     local_validation_time += local_timer.elapsed();
                                     local_timer = Instant::now();
 
                                     // Someone already aborted, continue to the work loop.
                                     continue;
                                 }
+                                scheduler.finish_validation(thread_id);
                                 // Set dirty in both static and dynamic mvhashmaps.
                                 let write_timer = Instant::now();
                                 versioned_data_cache.mark_dirty(

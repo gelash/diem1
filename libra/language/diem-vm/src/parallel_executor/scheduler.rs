@@ -311,6 +311,7 @@ impl Scheduler {
                 .iter()
                 .any(|marker| marker.load(Ordering::Acquire) < num_txns)
         {
+            // println!("check_done val_version {} markers {:?}", val_version, self.thread_commit_markers);
             // There are txns to validate.
             return;
         }
