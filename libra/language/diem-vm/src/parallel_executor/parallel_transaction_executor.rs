@@ -213,7 +213,7 @@ impl ParallelTransactionExecutor {
             for _ in 0..(compute_threads) {
                 thread_ids.fetch_add(1, Ordering::SeqCst);
                 s.spawn(|_| {
-                    let thread_id = thread_ids.load(Ordering::SeqCst)-1;
+                    let thread_id = thread_ids.load(Ordering::SeqCst) - 1;
                     let scheduler = Arc::clone(&scheduler);
                     // Make a new VM per thread -- with its own module cache
                     let thread_vm = DiemVM::new(base_view);
@@ -257,25 +257,17 @@ impl ParallelTransactionExecutor {
                                 r.validate(state_view.read_version_and_retry_num(r.path()))
                             });
                             local_validation_read_time += read_timer.elapsed();
+                            // println!("validation txn {}, valid {}", version_to_validate, valid);
 
-                            println!("validation txn {}, valid {}", version_to_validate, valid);
-                            if valid {
+                            if valid || !scheduler.abort(version_to_validate, &status_to_validate) {
                                 scheduler.finish_validation(thread_id);
-
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
-                                // Validation successfully completed, continue to the work loop.
+                                // Validation successfully completed or someone already aborted,
+                                // continue to the work loop.
                                 continue;
                             } else {
-                                if !scheduler.abort(version_to_validate, &status_to_validate) {
-                                    scheduler.finish_validation(thread_id);
-                                    local_validation_time += local_timer.elapsed();
-                                    local_timer = Instant::now();
-
-                                    // Someone already aborted, continue to the work loop.
-                                    continue;
-                                }
                                 scheduler.finish_validation(thread_id);
                                 // Set dirty in both static and dynamic mvhashmaps.
                                 let write_timer = Instant::now();

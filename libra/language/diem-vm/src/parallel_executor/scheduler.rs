@@ -235,7 +235,7 @@ impl Scheduler {
         // the caller usually has just observed the read dependency (so not executed state).
 
         // txn_dependency is initialized for all versions, so unwrap() is safe.
-        let mut stored_deps = self.txn_dependency[version].write().unwrap();
+        let mut stored_deps = self.txn_dependency[dep_version].write().unwrap();
         if !self.txn_status[dep_version].load().executed() {
             stored_deps.as_mut().unwrap().push(version);
             return true;
