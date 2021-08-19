@@ -191,7 +191,8 @@ impl ParallelTransactionExecutor {
         let checking_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let apply_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let other_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+        let get_txn_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+        let check_done_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
@@ -218,7 +219,8 @@ impl ParallelTransactionExecutor {
                     let mut local_execution_time = Duration::new(0, 0);
                     let mut local_checking_time = Duration::new(0, 0);
                     let mut local_apply_write_time = Duration::new(0, 0);
-                    let mut local_other_time = Duration::new(0, 0);
+                    let mut local_get_txn_to_exe_time = Duration::new(0, 0);
+                    let mut local_check_done_time = Duration::new(0, 0);
                     let mut local_validation_time = Duration::new(0, 0);
                     let mut local_validation_read_time = Duration::new(0, 0);
                     let mut local_validation_write_time = Duration::new(0, 0);
@@ -226,6 +228,8 @@ impl ParallelTransactionExecutor {
 
                     let mut i: usize = 0;
                     loop {
+                        local_timer = Instant::now();
+
                         if i >> 4 == thread_id {
                             // Every once in a while check if all txns are committed.
                             scheduler.check_done();
@@ -235,6 +239,9 @@ impl ParallelTransactionExecutor {
                             // The work is done, break from the loop.
                             break;
                         }
+
+                        local_check_done_time += local_timer.elapsed();
+                        local_timer = Instant::now();
 
                         let mut version_to_execute = None;
                         // First check if any txn can be validated
@@ -284,14 +291,14 @@ impl ParallelTransactionExecutor {
                                 revalidation_counter.fetch_add(1, Ordering::Relaxed);
                             }
                             local_validation_time += local_timer.elapsed();
-                            local_timer = Instant::now();
                         }
+                        local_timer = Instant::now();
 
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
                             version_to_execute = scheduler.next_txn_to_execute();
                             if version_to_execute.is_none() {
-                                local_other_time += local_timer.elapsed();
+                                local_get_txn_to_exe_time += local_timer.elapsed();
 
                                 // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
                                 // core to take resources and better HT.
@@ -381,8 +388,10 @@ impl ParallelTransactionExecutor {
                     *validation = max(local_validation_time, *validation);
                     let mut apply_write = apply_write_time.lock().unwrap();
                     *apply_write = max(local_apply_write_time, *apply_write);
-                    let mut other = other_time.lock().unwrap();
-                    *other = max(local_other_time, *other);
+                    let mut get_txn_to_exe = get_txn_to_exe_time.lock().unwrap();
+                    *get_txn_to_exe = max(local_get_txn_to_exe_time, *get_txn_to_exe);
+                    let mut check_done = check_done_time.lock().unwrap();
+                    *check_done = max(local_check_done_time, *check_done);
                     let mut validation_read = validation_read_time.lock().unwrap();
                     *validation_read = max(local_validation_read_time, *validation_read);
                     let mut validation_write = validation_write_time.lock().unwrap();
@@ -393,7 +402,9 @@ impl ParallelTransactionExecutor {
                     loop_vec.push(
                         local_execution_time.as_millis()
                             + local_checking_time.as_millis()
-                            + local_other_time.as_millis(),
+                            + local_get_txn_to_exe_time.as_millis()
+                            + local_check_done_time.as_millis()
+                            + local_validation_time.as_millis()
                     );
                 });
             }
@@ -462,10 +473,11 @@ impl ParallelTransactionExecutor {
 
         let all_results = outcomes.get_all_results(valid_results_length);
 
-        drop(infer_result);
+        drop(infer_result_iters);
 
         // Dropping large structures is expensive -- do this is a separate thread.
         ::std::thread::spawn(move || {
+            drop(infer_result);
             drop(signature_verified_block); // Explicit drops to measure their cost.
             drop(versioned_data_cache);
         });
@@ -475,7 +487,7 @@ impl ParallelTransactionExecutor {
         let remaining_time = timer.elapsed();
         let total_time = timer_start.elapsed();
         println!("=====PERF=====\n infer_rwset_time {:?}\n hack_infer_rwset_time {:?}\n mvhashmap_construction_time {:?}\n execution_loop_time {:?}\n set_output_time {:?}\n remaining_time {:?}\n\n total_time {:?}\n total_time without rw_analysis {:?}\n", infer_rwset_time, hack_infer_rwset_time, mvhashmap_construction_time, execution_loop_time, set_output_time, remaining_time, total_time, total_time-infer_rwset_time-hack_infer_rwset_time);
-        println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n other_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time, apply_write_time, checking_time, validation_time, validation_read_time, validation_write_time, other_time, execution_time_vec, loop_time_vec);
+        println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n check_done_time {:?}\n get_txn_to_exe_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time, apply_write_time, checking_time, validation_time, validation_read_time, validation_write_time, check_done_time, get_txn_to_exe_time, execution_time_vec, loop_time_vec);
 
         // scheduler.print_info();
 

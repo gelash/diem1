@@ -28,7 +28,7 @@ where
     S::Value: AUTransactionGen,
 {
     /// The number of accounts created by default.
-    pub const DEFAULT_NUM_ACCOUNTS: usize = 2;
+    pub const DEFAULT_NUM_ACCOUNTS: usize = 1000;
 
     /// The number of transactions created by default.
     pub const DEFAULT_NUM_TRANSACTIONS: usize = 10000;
