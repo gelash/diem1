@@ -309,6 +309,8 @@ impl ParallelTransactionExecutor {
                                 continue;
                             }
                         }
+                        local_get_txn_to_exe_time += local_timer.elapsed();
+                        local_timer = Instant::now();
 
                         let txn_to_execute = version_to_execute.unwrap();
 
@@ -405,6 +407,7 @@ impl ParallelTransactionExecutor {
                             + local_get_txn_to_exe_time.as_millis()
                             + local_check_done_time.as_millis()
                             + local_validation_time.as_millis()
+                            + local_apply_write_time.as_millis()
                     );
                 });
             }
