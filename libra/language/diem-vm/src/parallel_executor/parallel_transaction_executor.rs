@@ -209,9 +209,8 @@ impl ParallelTransactionExecutor {
                 percentage_of_each_txn_to_drop,
             );
             for _ in 0..(compute_threads) {
-                thread_ids.fetch_add(1, Ordering::SeqCst);
                 s.spawn(|_| {
-                    let thread_id = thread_ids.load(Ordering::SeqCst) - 1;
+                    let thread_id = thread_ids.fetch_add(1, Ordering::SeqCst);
                     let scheduler = Arc::clone(&scheduler);
                     // Make a new VM per thread -- with its own module cache
                     let thread_vm = DiemVM::new(base_view);
