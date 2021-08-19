@@ -25,7 +25,6 @@ use std::time::Instant;
 use std::{
     cmp::{max, min},
     collections::HashSet,
-    convert::{TryFrom, TryInto},
     hint,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -36,14 +35,12 @@ use std::{
 
 pub struct ParallelTransactionExecutor {
     num_cpus: usize,
-    txn_per_thread: u64,
 }
 
 impl ParallelTransactionExecutor {
     pub fn new() -> Self {
         Self {
             num_cpus: num_cpus::get(),
-            txn_per_thread: 50,
         }
     }
 
@@ -128,8 +125,8 @@ impl ParallelTransactionExecutor {
         // let mut rng = rand::thread_rng(); // randomness
         // let prob_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         // let percentage_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
-        let prob_of_each_txn_to_drop = 0.0;
-        let percentage_of_each_txn_to_drop = 0.0;
+        let prob_of_each_txn_to_drop = 1.0;
+        let percentage_of_each_txn_to_drop = 1.0;
         // Randomly drop some estimated writeset of some transaction
         let infer_result = self.hack_infer_results(
             prob_of_each_txn_to_drop,
@@ -294,13 +291,13 @@ impl ParallelTransactionExecutor {
                         if version_to_execute.is_none() {
                             version_to_execute = scheduler.next_txn_to_execute();
                             if version_to_execute.is_none() {
+                                local_other_time += local_timer.elapsed();
+
                                 // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
                                 // core to take resources and better HT.
                                 hint::spin_loop();
 
-                                local_other_time += local_timer.elapsed();
                                 local_timer = Instant::now();
-
                                 // Nothing to execute, continue to the work loop.
                                 continue;
                             }
@@ -327,10 +324,6 @@ impl ParallelTransactionExecutor {
                         }) {
                             delay_execution_counter.fetch_add(1, Ordering::Relaxed);
                             local_checking_time += local_timer.elapsed();
-
-                            // // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
-                            // // core to take resources and better HT.
-                            hint::spin_loop();
 
                             local_timer = Instant::now();
                             continue;

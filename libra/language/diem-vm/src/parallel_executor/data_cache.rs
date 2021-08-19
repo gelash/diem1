@@ -21,9 +21,9 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     convert::AsRef,
+    sync::{Arc, RwLock},
     thread,
     time::Duration,
-    sync::{Arc, RwLock},
 };
 
 pub struct VersionedDataCache(MultiVersionHashMap<AccessPath, Vec<u8>>);
@@ -32,13 +32,17 @@ pub struct VersionedStateView<'view> {
     version: usize,
     base_view: &'view dyn StateView,
     placeholder: &'view VersionedDataCache,
-    reads: Arc<RwLock<HashMap<
-        AccessPath,
-        (
-            Option<(usize, usize)>,
-            PartialVMResult<Option<Cow<'view, [u8]>>>,
-        ),
-    >>>,
+    reads: Arc<
+        RwLock<
+            HashMap<
+                AccessPath,
+                (
+                    Option<(usize, usize)>,
+                    PartialVMResult<Option<Cow<'view, [u8]>>>,
+                ),
+            >,
+        >,
+    >,
 }
 
 const ONE_MILLISEC: Duration = Duration::from_millis(10);
@@ -112,7 +116,7 @@ impl VersionedDataCache {
         version: usize,
         retry_num: usize,
         estimated_writes: &HashSet<AccessPath>,
-    ) -> Result<(), ()> {
+    ) {
         // First get all non-estimated writes
         if !output.status().is_discarded() {
             for (k, v) in output.write_set() {
@@ -143,7 +147,6 @@ impl VersionedDataCache {
         } else {
             self.set_skip_all(version, retry_num, estimated_writes);
         }
-        Ok(())
     }
 }
 
@@ -169,7 +172,9 @@ impl<'view> VersionedStateView<'view> {
 
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor> {
-        self.reads.write().unwrap()
+        self.reads
+            .write()
+            .unwrap()
             .drain()
             .map(|(path, (version_and_retry_num, _))| {
                 ReadDescriptor::new(path, version_and_retry_num)
@@ -219,7 +224,10 @@ impl<'view> VersionedStateView<'view> {
                     .get(access_path)
                     .map(|opt| opt.map(Cow::from))
                     .map_err(|_| PartialVMError::new(StatusCode::STORAGE_ERROR));
-                self.reads.write().unwrap().insert(access_path.clone(), (None, ret.clone()));
+                self.reads
+                    .write()
+                    .unwrap()
+                    .insert(access_path.clone(), (None, ret.clone()));
                 return ret.clone();
             }
 
