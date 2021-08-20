@@ -195,15 +195,22 @@ impl Scheduler {
 
             let num_decrease = val_marker & (1 << 32 - 1);
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
+
+            // Mark that thread is validating next_to_val, else early abort possible.
+            self.thread_commit_markers[thread_id].store(next_to_val, Ordering::Release);
+
+            // CAS to win the competition to actually validate next_to_val.
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
                 new_marker,
                 Ordering::Release, // Keep stores above.
                 Ordering::Relaxed, // Just read latest marker.
             ) {
-                // CAS successful, mark that thread is validating, return index & status.
-                self.thread_commit_markers[thread_id].store(next_to_val, Ordering::Release);
+                // CAS successful, return index & status.
                 return Some((next_to_val, next_status));
+            } else {
+                // CAS unsuccessful - not validating next_to_val (will try different index).
+                self.finish_validation(thread_id);
             }
         }
     }

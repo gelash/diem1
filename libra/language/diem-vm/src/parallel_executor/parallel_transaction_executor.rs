@@ -227,8 +227,6 @@ impl ParallelTransactionExecutor {
 
                     let mut i: usize = 0;
                     loop {
-                        local_timer = Instant::now();
-
                         if i >> 4 == thread_id {
                             // Every once in a while check if all txns are committed.
                             scheduler.check_done();
@@ -291,7 +289,6 @@ impl ParallelTransactionExecutor {
                             }
                             local_validation_time += local_timer.elapsed();
                         }
-                        local_timer = Instant::now();
 
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
@@ -406,7 +403,7 @@ impl ParallelTransactionExecutor {
                             + local_get_txn_to_exe_time.as_millis()
                             + local_check_done_time.as_millis()
                             + local_validation_time.as_millis()
-                            + local_apply_write_time.as_millis()
+                            + local_apply_write_time.as_millis(),
                     );
                 });
             }
