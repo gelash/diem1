@@ -294,12 +294,12 @@ impl Scheduler {
     // Reset the txn version/id to end execution earlier
     pub fn set_stop_version(&self, stop_version: usize) {
         self.stop_at_version
-            .fetch_min(stop_version, Ordering::Relaxed);
+            .fetch_min(stop_version, Ordering::Release);
     }
 
     // Get the last txn version/id
     pub fn num_txn_to_execute(&self) -> usize {
-        return self.stop_at_version.load(Ordering::Relaxed);
+        return self.stop_at_version.load(Ordering::Acquire);
     }
 
     // A lazy, relatively expensive check of whether the scheduler execution is completed.
@@ -308,7 +308,7 @@ impl Scheduler {
     // and thread commit markers. If >= stop_version, re-reads val marker to ensure it
     // (in particular, gen counter) hasn't changed - otherwise a race is possible.
     pub fn check_done(&self) {
-        let val_marker = self.validation_marker.load(Ordering::Acquire);
+        let val_marker = self.validation_marker.load(Ordering::SeqCst);
 
         let num_txns = self.num_txn_to_execute();
         let val_version = (val_marker >> 32) as usize;
@@ -324,14 +324,14 @@ impl Scheduler {
 
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
-        if val_marker == self.validation_marker.load(Ordering::Acquire) {
-            self.done_marker.store(1, Ordering::Release);
+        if val_marker == self.validation_marker.load(Ordering::SeqCst) {
+            self.done_marker.store(1, Ordering::SeqCst);
         }
     }
 
     // Checks whether the done marker is set. The marker can only be set by 'check_done'.
     pub fn done(&self) -> bool {
-        self.done_marker.load(Ordering::Acquire) == 1
+        self.done_marker.load(Ordering::SeqCst) == 1
     }
 
     // TODO: Implement for debugging & measurements.
