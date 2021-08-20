@@ -153,8 +153,8 @@ impl Scheduler {
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
                 new_marker,
-                Ordering::Release, // Keep stores above.
-                Ordering::Relaxed, // Just read latest marker.
+                Ordering::SeqCst, // Make sure my decrease is sequentially consistent.
+                Ordering::SeqCst, // Make sure any decrease is ordered before.
             ) {
                 // Successfully updated.
                 return;
@@ -197,14 +197,14 @@ impl Scheduler {
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
 
             // Mark that thread is validating next_to_val, else early abort possible.
-            self.thread_commit_markers[thread_id].store(next_to_val, Ordering::Release);
+            self.thread_commit_markers[thread_id].store(next_to_val, Ordering::SeqCst);
 
             // CAS to win the competition to actually validate next_to_val.
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
                 new_marker,
-                Ordering::Release, // Keep stores above.
-                Ordering::Relaxed, // Just read latest marker.
+                Ordering::SeqCst, // Keep all status stores above.
+                Ordering::Relaxed,
             ) {
                 // CAS successful, return index & status.
                 return Some((next_to_val, next_status));
@@ -288,7 +288,7 @@ impl Scheduler {
     }
 
     pub fn finish_validation(&self, thread_id: usize) {
-        self.thread_commit_markers[thread_id].store(usize::MAX, Ordering::Release);
+        self.thread_commit_markers[thread_id].store(usize::MAX, Ordering::SeqCst);
     }
 
     // Reset the txn version/id to end execution earlier
@@ -316,9 +316,8 @@ impl Scheduler {
             || self
                 .thread_commit_markers
                 .iter()
-                .any(|marker| marker.load(Ordering::Acquire) < num_txns)
+                .any(|marker| marker.load(Ordering::SeqCst) < num_txns)
         {
-            // println!("check_done val_version {} markers {:?}", val_version, self.thread_commit_markers);
             // There are txns to validate.
             return;
         }
