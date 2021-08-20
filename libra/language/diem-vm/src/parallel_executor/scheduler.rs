@@ -203,8 +203,8 @@ impl Scheduler {
             if let Ok(_) = self.validation_marker.compare_exchange(
                 val_marker,
                 new_marker,
-                Ordering::SeqCst, // Keep all status stores above.
-                Ordering::Relaxed,
+                Ordering::SeqCst, // Keep status stores above.
+                Ordering::Acquire,
             ) {
                 // CAS successful, return index & status.
                 return Some((next_to_val, next_status));
