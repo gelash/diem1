@@ -126,6 +126,7 @@ impl ParallelTransactionExecutor {
         // let percentage_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         let prob_of_each_txn_to_drop = 1.0;
         let percentage_of_each_txn_to_drop = 0.1;
+        // let percentage_of_each_txn_to_drop = 1.0;
         // Randomly drop some estimated writeset of some transaction
         let infer_result = self.hack_infer_results(
             prob_of_each_txn_to_drop,

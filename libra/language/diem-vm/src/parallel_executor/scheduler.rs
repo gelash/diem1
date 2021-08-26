@@ -137,7 +137,7 @@ impl Scheduler {
 
     fn decrease_validation_marker(&self, target_version: usize) {
         loop {
-            let val_marker = self.validation_marker.load(Ordering::Acquire);
+            let val_marker = self.validation_marker.load(Ordering::SeqCst);
 
             let val_version = val_marker >> 32;
             if val_version as usize <= target_version {
@@ -209,7 +209,9 @@ impl Scheduler {
                 return Some((next_to_val, next_status));
             } else {
                 // CAS unsuccessful - not validating next_to_val (will try different index).
-                self.finish_validation();
+                if self.finish_validation() == 1 {
+                    self.check_done();
+                }
             }
         }
     }
@@ -319,12 +321,14 @@ impl Scheduler {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
-            self.done_marker.store(1, Ordering::SeqCst);
+            // self.done_marker.store(1, Ordering::SeqCst);
+            self.done_marker.store(1, Ordering::Release);
         }
     }
 
     // Checks whether the done marker is set. The marker can only be set by 'check_done'.
     pub fn done(&self) -> bool {
-        self.done_marker.load(Ordering::SeqCst) == 1
+        // self.done_marker.load(Ordering::SeqCst) == 1
+        self.done_marker.load(Ordering::Acquire) == 1
     }
 }
