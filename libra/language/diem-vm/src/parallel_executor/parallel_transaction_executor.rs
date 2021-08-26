@@ -25,6 +25,7 @@ use std::time::Instant;
 use std::{
     cmp::{max, min},
     collections::HashSet,
+    hint,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -215,13 +216,21 @@ impl ParallelTransactionExecutor {
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
+                    let mut validators: Option<usize> = None;
                     loop {
+                        if let Some(1) = validators {
+                            // Thread was just last to validate: check if done.
+                            scheduler.check_done();
+                        }
+
                         if scheduler.done() {
                             // The work is done, break from the loop.
                             break;
                         }
 
                         let mut version_to_execute = None;
+                        validators = None;
+
                         // First check if any txn can be validated
                         if let Some((version_to_validate, status_to_validate)) =
                             scheduler.next_txn_to_validate()
@@ -239,10 +248,9 @@ impl ParallelTransactionExecutor {
                                 r.validate(state_view.read_version_and_retry_num(r.path()))
                             });
                             local_validation_read_time += read_timer.elapsed();
-                            // println!("validation txn {}, valid {}", version_to_validate, valid);
 
                             if valid || !scheduler.abort(version_to_validate, &status_to_validate) {
-                                scheduler.finish_validation();
+                                validators = Some(scheduler.finish_validation());
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
@@ -251,8 +259,8 @@ impl ParallelTransactionExecutor {
                                 continue;
                             }
 
-                            // Successfully aborted.
-                            scheduler.finish_validation();
+                            // Not valid && successfully aborted.
+                            validators = Some(scheduler.finish_validation());
                             // Set dirty in both static and dynamic mvhashmaps.
                             let write_timer = Instant::now();
                             versioned_data_cache.mark_dirty(
@@ -280,8 +288,8 @@ impl ParallelTransactionExecutor {
                                 local_nothing_to_exe_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
-                                scheduler.check_done();
-                                // TODO: If we optimize for HT, consider adding back spin::hint().
+                                // Give up the resources so other threads can progress (HT).
+                                hint::spin_loop();
 
                                 local_check_done_time += local_timer.elapsed();
                                 local_timer = Instant::now();
@@ -290,6 +298,7 @@ impl ParallelTransactionExecutor {
                                 continue;
                             }
                         }
+                        validators = None;
                         local_get_txn_to_exe_time += local_timer.elapsed();
                         local_timer = Instant::now();
 

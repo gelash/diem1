@@ -286,8 +286,8 @@ impl Scheduler {
         }
     }
 
-    pub fn finish_validation(&self) {
-        self.num_validating.fetch_sub(1, Ordering::SeqCst);
+    pub fn finish_validation(&self) -> usize {
+        self.num_validating.fetch_sub(1, Ordering::SeqCst)
     }
 
     // Reset the txn version/id to end execution earlier
@@ -319,12 +319,12 @@ impl Scheduler {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
-            self.done_marker.store(1, Ordering::Release);
+            self.done_marker.store(1, Ordering::SeqCst);
         }
     }
 
     // Checks whether the done marker is set. The marker can only be set by 'check_done'.
     pub fn done(&self) -> bool {
-        self.done_marker.load(Ordering::Acquire) == 1
+        self.done_marker.load(Ordering::SeqCst) == 1
     }
 }
