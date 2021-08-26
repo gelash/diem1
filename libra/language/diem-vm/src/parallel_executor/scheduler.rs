@@ -98,9 +98,10 @@ pub struct Scheduler {
     // First 32 bits: next index to validate, resets (is decreased) upon aborts.
     // Last 32 bits: generation counter that's incremented every time the validation index is decreased.
     validation_marker: AtomicU64,
-    // Stores per thread transaction version it is validating, or max::usize if the thread isn't
-    // validating. Min of these values and validation index (if read atomically) is safe to commit.
-    thread_commit_markers: Vec<CachePadded<AtomicUsize>>,
+    // Stores number of threads that are currently validating. Used in combination with validation
+    // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
+    // counter would generalize to detect what prefix can be committed.
+    num_validating: AtomicUsize,
     // Shared marker that's set when a thread detects all txns can be committed - so
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
@@ -115,13 +116,11 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(num_txns: usize, num_threads: usize) -> Self {
+    pub fn new(num_txns: usize) -> Self {
         Self {
             execution_marker: AtomicUsize::new(0),
             validation_marker: AtomicU64::new(0),
-            thread_commit_markers: (0..num_threads)
-                .map(|_| CachePadded::new(AtomicUsize::new(usize::MAX)))
-                .collect(),
+            num_validating: AtomicUsize::new(0),
             done_marker: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
             txn_buffer: SegQueue::new(),
@@ -179,7 +178,7 @@ impl Scheduler {
     }
 
     // Return the next txn version & status for the thread to validate.
-    pub fn next_txn_to_validate(&self, thread_id: usize) -> Option<(usize, Arc<STMStatus>)> {
+    pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus>)> {
         loop {
             let val_marker = self.validation_marker.load(Ordering::Acquire); // status read below.
 
@@ -197,7 +196,7 @@ impl Scheduler {
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
 
             // Mark that thread is validating next_to_val, else early abort possible.
-            self.thread_commit_markers[thread_id].store(next_to_val, Ordering::SeqCst);
+            self.num_validating.fetch_add(1, Ordering::SeqCst);
 
             // CAS to win the competition to actually validate next_to_val.
             if let Ok(_) = self.validation_marker.compare_exchange(
@@ -210,7 +209,7 @@ impl Scheduler {
                 return Some((next_to_val, next_status));
             } else {
                 // CAS unsuccessful - not validating next_to_val (will try different index).
-                self.finish_validation(thread_id);
+                self.finish_validation();
             }
         }
     }
@@ -287,8 +286,8 @@ impl Scheduler {
         }
     }
 
-    pub fn finish_validation(&self, thread_id: usize) {
-        self.thread_commit_markers[thread_id].store(usize::MAX, Ordering::SeqCst);
+    pub fn finish_validation(&self) {
+        self.num_validating.fetch_sub(1, Ordering::SeqCst);
     }
 
     // Reset the txn version/id to end execution earlier
@@ -312,12 +311,7 @@ impl Scheduler {
 
         let num_txns = self.num_txn_to_execute();
         let val_version = (val_marker >> 32) as usize;
-        if val_version < num_txns
-            || self
-                .thread_commit_markers
-                .iter()
-                .any(|marker| marker.load(Ordering::SeqCst) < num_txns)
-        {
+        if val_version < num_txns || self.num_validating.load(Ordering::SeqCst) > 0 {
             // There are txns to validate.
             return;
         }
@@ -325,35 +319,12 @@ impl Scheduler {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
-            self.done_marker.store(1, Ordering::SeqCst);
+            self.done_marker.store(1, Ordering::Release);
         }
     }
 
     // Checks whether the done marker is set. The marker can only be set by 'check_done'.
     pub fn done(&self) -> bool {
-        self.done_marker.load(Ordering::SeqCst) == 1
+        self.done_marker.load(Ordering::Acquire) == 1
     }
-
-    // TODO: Implement for debugging & measurements.
-    // pub fn sum_retry_num(&self) -> usize {
-    //     let num = self.stop_when.load(Ordering::SeqCst);
-    //     let mut sum = 0;
-    //     for i in 0..num {
-    //         sum += self.retry_num_vec[i].load(Ordering::SeqCst);
-    //     }
-    //     return sum;
-    // }
-
-    // pub fn print_info(&self) {
-    //     let val = self.val_index.lock().unwrap().load(Ordering::SeqCst);
-    //     let commit_idx = self.commit_index.load(Ordering::SeqCst);
-    //     let execute = self.execute_idx.load(Ordering::SeqCst);
-    //     println!(
-    //         "Thread {:?} commit_idx {} val_idx {} execute_idx {}",
-    //         thread::current().id(),
-    //         commit_idx,
-    //         val,
-    //         execute
-    //     );
-    // }
 }

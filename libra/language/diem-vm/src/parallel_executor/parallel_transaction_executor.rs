@@ -25,12 +25,10 @@ use std::time::Instant;
 use std::{
     cmp::{max, min},
     collections::HashSet,
-    hint,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    thread,
 };
 
 pub struct ParallelTransactionExecutor {
@@ -126,7 +124,7 @@ impl ParallelTransactionExecutor {
         // let prob_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         // let percentage_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         let prob_of_each_txn_to_drop = 1.0;
-        let percentage_of_each_txn_to_drop = 1.0;
+        let percentage_of_each_txn_to_drop = 0.1;
         // Randomly drop some estimated writeset of some transaction
         let infer_result = self.hack_infer_results(
             prob_of_each_txn_to_drop,
@@ -169,17 +167,9 @@ impl ParallelTransactionExecutor {
 
         // Ensure we have at least 50 tx per thread and no higher rate of conflict than concurrency.
         let compute_threads = min(1 + (num_txns / 50), self.num_cpus - 1);
-        let mut ones_mask = 1;
-        // Set a bit to the left until compute_threads covered by the mask.
-        while ones_mask < compute_threads {
-            ones_mask = (ones_mask << 1) | 1;
-        }
-        // Threads mask is used to decide when each thread performs an expensive check whether
-        // the execution is completed (all transactions can be committed from STM prospective).
-        // Appending 4 1's to the right ensures the check happens once every 16 iterations.
-        let threads_mask = (ones_mask << 4) | 15;
+        // let compute_threads = 7;
 
-        let scheduler = Arc::new(Scheduler::new(num_txns, compute_threads));
+        let scheduler = Arc::new(Scheduler::new(num_txns));
 
         let delay_execution_counter = AtomicUsize::new(0);
         let revalidation_counter = AtomicUsize::new(0);
@@ -199,7 +189,6 @@ impl ParallelTransactionExecutor {
         let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
 
-        let thread_ids = AtomicUsize::new(0);
         scope(|s| {
             println!(
                 "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}, prob_of_each_txn_to_drop {}, percentage_of_each_txn_to_drop {}",
@@ -211,7 +200,6 @@ impl ParallelTransactionExecutor {
             );
             for _ in 0..(compute_threads) {
                 s.spawn(|_| {
-                    let thread_id = thread_ids.fetch_add(1, Ordering::SeqCst);
                     let scheduler = Arc::clone(&scheduler);
                     // Make a new VM per thread -- with its own module cache
                     let thread_vm = DiemVM::new(base_view);
@@ -227,25 +215,16 @@ impl ParallelTransactionExecutor {
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
-                    let mut i: usize = 0;
                     loop {
-                        if i >> 4 == thread_id {
-                            // Every once in a while check if all txns are committed.
-                            scheduler.check_done();
-                        }
-                        i = (i + 1) & threads_mask;
                         if scheduler.done() {
                             // The work is done, break from the loop.
                             break;
                         }
 
-                        local_check_done_time += local_timer.elapsed();
-                        local_timer = Instant::now();
-
                         let mut version_to_execute = None;
                         // First check if any txn can be validated
                         if let Some((version_to_validate, status_to_validate)) =
-                            scheduler.next_txn_to_validate(thread_id)
+                            scheduler.next_txn_to_validate()
                         {
                             // There is a txn to be validated
 
@@ -263,7 +242,7 @@ impl ParallelTransactionExecutor {
                             // println!("validation txn {}, valid {}", version_to_validate, valid);
 
                             if valid || !scheduler.abort(version_to_validate, &status_to_validate) {
-                                scheduler.finish_validation(thread_id);
+                                scheduler.finish_validation();
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
@@ -273,7 +252,7 @@ impl ParallelTransactionExecutor {
                             }
 
                             // Successfully aborted.
-                            scheduler.finish_validation(thread_id);
+                            scheduler.finish_validation();
                             // Set dirty in both static and dynamic mvhashmaps.
                             let write_timer = Instant::now();
                             versioned_data_cache.mark_dirty(
@@ -301,9 +280,11 @@ impl ParallelTransactionExecutor {
                                 local_nothing_to_exe_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
-                                // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
-                                // core to take resources and better HT.
-                                hint::spin_loop();
+                                scheduler.check_done();
+                                // TODO: If we optimize for HT, consider adding back spin::hint().
+
+                                local_check_done_time += local_timer.elapsed();
+                                local_timer = Instant::now();
 
                                 // Nothing to execute, continue to the work loop.
                                 continue;
