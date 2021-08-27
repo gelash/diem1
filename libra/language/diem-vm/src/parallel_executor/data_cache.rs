@@ -92,6 +92,10 @@ impl VersionedDataCache {
         }
     }
 
+    pub fn dynamic_empty(&self) -> bool {
+        self.as_ref().dynamic_empty()
+    }
+
     pub fn mark_dirty(
         &self,
         version: usize,

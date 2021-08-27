@@ -124,9 +124,12 @@ impl ParallelTransactionExecutor {
         // let mut rng = rand::thread_rng(); // randomness
         // let prob_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
         // let percentage_of_each_txn_to_drop = rng.gen_range(0.0..1.0);
-        let prob_of_each_txn_to_drop = 1.0;
-        let percentage_of_each_txn_to_drop = 0.1;
+        // let prob_of_each_txn_to_drop = 1.0;
+        // let prob_of_each_txn_to_drop = 0.1;
+        let prob_of_each_txn_to_drop = 0.0;
         // let percentage_of_each_txn_to_drop = 1.0;
+        // let percentage_of_each_txn_to_drop = 0.1;
+        let percentage_of_each_txn_to_drop = 0.0;
         // Randomly drop some estimated writeset of some transaction
         let infer_result = self.hack_infer_results(
             prob_of_each_txn_to_drop,
@@ -246,9 +249,13 @@ impl ParallelTransactionExecutor {
                             );
 
                             let read_timer = Instant::now();
-                            let valid = status_to_validate.read_set().iter().all(|r| {
-                                r.validate(state_view.read_version_and_retry_num(r.path()))
-                            });
+                            // If dynamic mv data-structure hasn't been written to, it's safe
+                            // to skip validation - it is going to succeed (in order to be
+                            // validating, all prior txn's must have been executed already).
+                            let valid = versioned_data_cache.dynamic_empty()
+                                || status_to_validate.read_set().iter().all(|r| {
+                                    r.validate(state_view.read_version_and_retry_num(r.path()))
+                                });
                             local_validation_read_time += read_timer.elapsed();
 
                             if !valid && scheduler.abort(version_to_validate, &status_to_validate) {

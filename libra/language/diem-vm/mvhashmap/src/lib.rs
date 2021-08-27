@@ -1,15 +1,15 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::{
     cmp::{max, PartialOrd},
     collections::{btree_map::BTreeMap, HashMap},
     hash::Hash,
-    sync::atomic::{AtomicUsize, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
 };
-use dashmap::DashMap;
-use arc_swap::ArcSwap;
 
 /// A structure that holds placeholders for each write to the database
 //
@@ -58,7 +58,7 @@ pub struct StaticMVHashMap<K, V> {
 }
 
 pub struct DynamicMVHashMap<K, V> {
-    is_empty: AtomicBool,
+    empty: AtomicUsize,
     // data: Arc<DashMap<K, HashMap<Version, WriteVersionValue<V>>>>,
     data: Arc<DashMap<K, BTreeMap<Version, WriteVersionValue<V>>>>,
 }
@@ -68,7 +68,9 @@ pub struct MultiVersionHashMap<K, V> {
     d_mvhashmap: DynamicMVHashMap<K, V>,
 }
 
-impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Hash + Clone + Send + Sync> MultiVersionHashMap<K, V> {
+impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Hash + Clone + Send + Sync>
+    MultiVersionHashMap<K, V>
+{
     pub fn new() -> MultiVersionHashMap<K, V> {
         MultiVersionHashMap {
             s_mvhashmap: StaticMVHashMap::new(),
@@ -76,16 +78,29 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Hash + Clone + Send + Sync> Mu
         }
     }
 
-    pub fn new_from_parallel(possible_writes: Vec<(K, Version)>) -> (usize, MultiVersionHashMap<K, V>) {
-        let (max_dependency_length, s_mvhashmap) = StaticMVHashMap::new_from_parallel(possible_writes);
+    pub fn new_from_parallel(
+        possible_writes: Vec<(K, Version)>,
+    ) -> (usize, MultiVersionHashMap<K, V>) {
+        let (max_dependency_length, s_mvhashmap) =
+            StaticMVHashMap::new_from_parallel(possible_writes);
         let d_mvhashmap = DynamicMVHashMap::new();
-        (max_dependency_length, MultiVersionHashMap{ s_mvhashmap, d_mvhashmap })
+        (
+            max_dependency_length,
+            MultiVersionHashMap {
+                s_mvhashmap,
+                d_mvhashmap,
+            },
+        )
     }
 
     // For the entry of same verison/txn_id, it should only appear in only one mvhashmap since a write is either estimated or non-estimated
     // Return the higher version data ranked by version, if read data from both mvhashmaps
     // If read both dependency and data, return the higher version
-    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         // reads may return Ok((Option<V>, Version, retry_num)), Err(Some(Version)) or Err(None)
         let read_from_static = self.s_mvhashmap.read(key, version);
         let read_from_dynamic = self.d_mvhashmap.read(key, version);
@@ -121,28 +136,62 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Hash + Clone + Send + Sync> Mu
         }
     }
 
-    pub fn read_from_static(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read_from_static(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         self.s_mvhashmap.read(key, version)
     }
 
-    pub fn read_from_dynamic(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read_from_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         self.d_mvhashmap.read(key, version)
     }
 
-    pub fn write_to_static(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), ()> {
+    pub fn write_to_static(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
         self.s_mvhashmap.write(key, version, retry_num, data)
     }
 
-    pub fn write_to_dynamic(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), ()> {
+    pub fn write_to_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
         self.d_mvhashmap.write(key, version, retry_num, data)
     }
 
-    pub fn set_dirty_to_static(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
+    pub fn set_dirty_to_static(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), ()> {
         self.s_mvhashmap.set_dirty(key, version, retry_num)
     }
 
-    pub fn set_dirty_to_dynamic(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
+    pub fn set_dirty_to_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), ()> {
         self.d_mvhashmap.set_dirty(key, version, retry_num)
+    }
+
+    pub fn dynamic_empty(&self) -> bool {
+        self.d_mvhashmap.empty()
     }
 
     pub fn skip(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
@@ -164,34 +213,50 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Hash + Clone + Send + Sync> Mu
 impl<K: Hash + Clone + Eq, V: Hash + Clone> DynamicMVHashMap<K, V> {
     pub fn new() -> DynamicMVHashMap<K, V> {
         DynamicMVHashMap {
-            is_empty: AtomicBool::new(true),
+            empty: AtomicUsize::new(1),
             data: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn write(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), ()> {
-        if self.is_empty.load(Ordering::SeqCst) {
-            self.is_empty.store(false, Ordering::SeqCst);
+    pub fn write(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            self.empty.store(0, Ordering::SeqCst);
         }
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(version, WriteVersionValue::new_from(FLAG_DONE, retry_num, data));
+        map.insert(
+            version,
+            WriteVersionValue::new_from(FLAG_DONE, retry_num, data),
+        );
 
         Ok(())
     }
 
     pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
-        if self.is_empty.load(Ordering::SeqCst) {
-            self.is_empty.store(false, Ordering::SeqCst);
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            self.empty.store(0, Ordering::SeqCst);
         }
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(version, WriteVersionValue::new_from(FLAG_DIRTY, retry_num, None));
+        map.insert(
+            version,
+            WriteVersionValue::new_from(FLAG_DIRTY, retry_num, None),
+        );
 
         Ok(())
     }
 
     // read when using Btree, may return Ok((Option<V>, Version, retry_num)), Err(Some(Version)) or Err(None)
-    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
-        if self.is_empty.load(Ordering::SeqCst) {
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        if self.empty.load(Ordering::SeqCst) == 1 {
             return Err(None);
         }
         match self.data.get(key) {
@@ -209,23 +274,31 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> DynamicMVHashMap<K, V> {
 
                         // The entry is populated so return its contents
                         if flag == FLAG_DONE {
-                            return Ok(((**entry_val.data.load()).clone(), *entry_key, entry_val.retry_num.load(Ordering::SeqCst)));
+                            return Ok((
+                                (**entry_val.data.load()).clone(),
+                                *entry_key,
+                                entry_val.retry_num.load(Ordering::SeqCst),
+                            ));
                         }
 
                         unreachable!();
                     }
                 }
                 return Err(None);
-            },
+            }
             None => {
                 return Err(None);
             }
         }
     }
 
+    pub fn empty(&self) -> bool {
+        self.empty.load(Ordering::SeqCst) == 1
+    }
+
     // returns (max depth, avg depth) of dynamic hashmap
     pub fn get_depth(&self) -> (usize, usize) {
-        if self.is_empty.load(Ordering::SeqCst) {
+        if self.empty.load(Ordering::SeqCst) == 1 {
             return (0, 0);
         }
         let mut max = 0;
@@ -238,7 +311,7 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> DynamicMVHashMap<K, V> {
                 max = size;
             }
         }
-        return (max, sum/self.data.len());
+        return (max, sum / self.data.len());
     }
 }
 
@@ -259,7 +332,7 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> StaticMVHashMap<K, V> {
         (
             map.values()
                 .fold(0, |max_depth, map| max(max_depth, map.len())),
-                StaticMVHashMap { data: map },
+            StaticMVHashMap { data: map },
         )
     }
 
@@ -280,7 +353,13 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> StaticMVHashMap<K, V> {
         self.data.contains_key(key)
     }
 
-    pub fn write(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), ()> {
+    pub fn write(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
         let entry = self
             .data
             .get(key)
@@ -338,7 +417,11 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> StaticMVHashMap<K, V> {
         Ok(())
     }
 
-    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         // Get the smaller key
         let tree = self.data.get(key).ok_or_else(|| None)?;
 
@@ -385,7 +468,7 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> StaticMVHashMap<K, V> {
                 max = size;
             }
         }
-        return (max, sum/self.data.len());
+        return (max, sum / self.data.len());
     }
 }
 
@@ -481,7 +564,12 @@ mod tests {
         let ap1 = b"/foo/b".to_vec();
         let ap2 = b"/foo/c".to_vec();
 
-        let data = vec![(ap1.clone(), 10), (ap2.clone(), 10), (ap2.clone(), 20), (ap2.clone(), 30)];
+        let data = vec![
+            (ap1.clone(), 10),
+            (ap2.clone(), 10),
+            (ap2.clone(), 20),
+            (ap2.clone(), 30),
+        ];
 
         let mvtbl = DynamicMVHashMap::new();
 
