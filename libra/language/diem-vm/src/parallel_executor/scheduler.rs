@@ -209,7 +209,7 @@ impl Scheduler {
                 return Some((next_to_val, next_status));
             } else {
                 // CAS unsuccessful - not validating next_to_val (will try different index).
-                if self.finish_validation() == 1 {
+                if self.finish_validation() {
                     self.check_done();
                 }
             }
@@ -288,8 +288,9 @@ impl Scheduler {
         }
     }
 
-    pub fn finish_validation(&self) -> usize {
-        self.num_validating.fetch_sub(1, Ordering::SeqCst)
+    // Returns true if there are no active validators left.
+    pub fn finish_validation(&self) -> bool {
+        self.num_validating.fetch_sub(1, Ordering::SeqCst) == 1
     }
 
     // Reset the txn version/id to end execution earlier

@@ -168,8 +168,8 @@ impl ParallelTransactionExecutor {
         );
 
         // Ensure we have at least 50 tx per thread and no higher rate of conflict than concurrency.
-        let compute_threads = min(1 + (num_txns / 50), self.num_cpus - 1);
-        // let compute_threads = 7;
+        // let compute_threads = min(1 + (num_txns / 50), self.num_cpus - 1);
+        let compute_threads = 7;
 
         let scheduler = Arc::new(Scheduler::new(num_txns));
 
@@ -217,10 +217,11 @@ impl ParallelTransactionExecutor {
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
-                    let mut validators: Option<usize> = None;
+                    let mut last_validator_no_work = false;
                     loop {
-                        if let Some(1) = validators {
-                            // Thread was just last to validate: check if done.
+                        if last_validator_no_work {
+                            // Thread was just last to validate and had nothing to
+                            // execute: check if execution is done.
                             scheduler.check_done();
                         }
 
@@ -230,7 +231,7 @@ impl ParallelTransactionExecutor {
                         }
 
                         let mut version_to_execute = None;
-                        validators = None;
+                        last_validator_no_work = false;
 
                         // First check if any txn can be validated
                         if let Some((version_to_validate, status_to_validate)) =
@@ -250,36 +251,36 @@ impl ParallelTransactionExecutor {
                             });
                             local_validation_read_time += read_timer.elapsed();
 
-                            if valid || !scheduler.abort(version_to_validate, &status_to_validate) {
-                                validators = Some(scheduler.finish_validation());
-                                local_validation_time += local_timer.elapsed();
-                                local_timer = Instant::now();
+                            if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
+                                // Not valid && successfully aborted.
 
+                                // Set dirty in both static and dynamic mvhashmaps.
+                                let write_timer = Instant::now();
+                                versioned_data_cache.mark_dirty(
+                                    version_to_validate,
+                                    status_to_validate.retry_num(),
+                                    &infer_result[version_to_validate].1,
+                                    status_to_validate.write_set(),
+                                );
+                                local_validation_write_time += write_timer.elapsed();
+
+                                // Thread will immediately re-execute this txn (bypass global scheduling).
+                                // Avoids overhead, and also aborted txn is high priority to re-execute ASAP
+                                // to enable successfully executing/validating subsequent txns.
+                                version_to_execute = Some(version_to_validate);
+
+                                revalidation_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            last_validator_no_work = scheduler.finish_validation();
+                            local_validation_time += local_timer.elapsed();
+                            local_timer = Instant::now();
+
+                            if version_to_execute.is_none() {
                                 // Validation successfully completed or someone already aborted,
                                 // continue to the work loop.
                                 continue;
                             }
-
-                            // Not valid && successfully aborted.
-                            validators = Some(scheduler.finish_validation());
-                            // Set dirty in both static and dynamic mvhashmaps.
-                            let write_timer = Instant::now();
-                            versioned_data_cache.mark_dirty(
-                                version_to_validate,
-                                status_to_validate.retry_num(),
-                                &infer_result[version_to_validate].1,
-                                status_to_validate.write_set(),
-                            );
-                            local_validation_write_time += write_timer.elapsed();
-
-                            // Thread will immediately re-execute this txn (bypass global scheduling).
-                            // Rationale is to avoid overhead, and also aborted txn is high priority
-                            // to re-execute asap to enable successfully executing/validating subsequent txns.
-                            version_to_execute = Some(version_to_validate);
-
-                            revalidation_counter.fetch_add(1, Ordering::Relaxed);
-                            local_validation_time += local_timer.elapsed();
-                            local_timer = Instant::now();
                         }
 
                         // If there is no txn to be committed or validated, get the next txn to execute
@@ -299,7 +300,7 @@ impl ParallelTransactionExecutor {
                                 continue;
                             }
                         }
-                        validators = None;
+                        last_validator_no_work = false;
                         local_get_txn_to_exe_time += local_timer.elapsed();
                         local_timer = Instant::now();
 
