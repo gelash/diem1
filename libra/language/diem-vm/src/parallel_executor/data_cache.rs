@@ -193,7 +193,7 @@ impl<'view> VersionedStateView<'view> {
         access_path: &AccessPath,
         read_version: usize,
     ) -> Option<usize> {
-        let read = self.placeholder.as_ref().read(access_path, read_version);
+        let read = self.placeholder.as_ref().read_from_static(access_path, read_version);
         if let Err(Some((version, _))) = read {
             return Some(version);
         }

@@ -433,12 +433,12 @@ impl<K: Hash + Clone + Eq, V: Hash + Clone> StaticMVHashMap<K, V> {
                 let retry = entry_val.retry_num.load(Ordering::SeqCst);
 
                 // Return this key, must wait.
-                if flag == FLAG_UNASSIGNED {
+                if flag == FLAG_UNASSIGNED || flag == FLAG_DIRTY {
                     return Err(Some((*entry_key, retry)));
                 }
 
                 // If we are to skip this entry, pick the next one
-                if flag == FLAG_SKIP || flag == FLAG_DIRTY {
+                if flag == FLAG_SKIP {
                     continue;
                 }
 
