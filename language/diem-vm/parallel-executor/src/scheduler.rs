@@ -1,44 +1,228 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-
+use arc_swap::ArcSwap;
+use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
 use mvhashmap::Version;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, RwLock, Mutex,
+};
+use crate::{
+    errors::{Error, Result},
+    task::{ExecutionStatus, Transaction, TransactionOutput},
 };
 
-#[repr(usize)]
-enum ExecutionStatus {
-    Executed = 1,
-    NotExecuted = 0,
+// #[repr(usize)]
+// enum ExecutionStatus {
+//     Executed = 1,
+//     NotExecuted = 0,
+// }
+
+#[derive(Clone)]
+pub struct ReadDescriptor<K> {
+    access_path: K,
+
+    // Is set to (version, retry_num) if the read was from shared MV data-structure
+    // (written by a previous txn), None if read from storage.
+    version_and_retry_num: Option<(usize, usize)>, // TODO: Version alias for usize.
 }
 
-pub struct Scheduler {
+impl<K> ReadDescriptor<K> {
+    pub fn new(access_path: K, version_and_retry_num: Option<(usize, usize)>) -> Self {
+        Self {
+            access_path,
+            version_and_retry_num,
+        }
+    }
+
+    pub fn path(&self) -> &K {
+        &self.access_path
+    }
+
+    pub fn validate(&self, new_version_and_retry_num: Option<(usize, usize)>) -> bool {
+        self.version_and_retry_num == new_version_and_retry_num
+    }
+}
+
+// Transaction status, updated using RCU. Starts with retry_num = 0 and input_output = None
+// that signifies NOT_EXECUTED status. When the transaction is first executed, new STMStatus
+// w. retry_num = 1 and the input/output of the corresponding execution will be stored.
+// If the transaction is later aborted, the status will become (1, None).
+pub struct STMStatus<K, T, E> {
+    retry_num: usize, // how many times the corresponding txn has been re-tried.
+
+    // Transactions input/output set from the last execution (for all actual reads and writes).
+    // For reads we just store (version, retry_num) pairs. TODO: Version alias for usize.
+    // If None, then the corresponding retry_num execution hasn't yet completed.
+    input_output: Option<(Vec<ReadDescriptor<K>>, ExecutionStatus<T, Error<E>>)>,
+}
+
+impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
+    pub fn new_before_execution(retry_num: usize) -> Self {
+        Self {
+            retry_num,
+            input_output: None,
+        }
+    }
+
+    pub fn new_after_execution(
+        retry_num: usize,
+        input: Vec<ReadDescriptor<K>>,
+        output: ExecutionStatus<T, Error<E>>,
+    ) -> Self {
+        Self {
+            retry_num,
+            input_output: Some((input, output)),
+        }
+    }
+
+    pub fn executed(&self) -> bool {
+        self.input_output.is_some()
+    }
+
+    pub fn retry_num(&self) -> usize {
+        self.retry_num
+    }
+
+    // executed() must hold, i.e. input_output != None. Returns a reference to the inner Vec.
+    pub fn read_set(&self) -> &Vec<ReadDescriptor<K>> {
+        &self.input_output.as_ref().unwrap().0
+    }
+
+    // // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
+    // pub fn write_set(&self) -> &Vec<(<<T as TransactionOutput>::T as Transaction>::Key, <<T as TransactionOutput>::T as Transaction>::Value)> {
+    //     let output = &self.input_output.as_ref().unwrap().1;
+    //     &output.get_writes()
+    // }
+
+    pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
+        self.input_output.as_ref().unwrap().1.clone()
+    }
+}
+
+pub struct Scheduler<K, T, E> {
     // Shared index (version) of the next txn to be executed from the original transaction sequence.
     execution_marker: AtomicUsize,
+    // Shared validation marker:
+    // First 32 bits: next index to validate, resets (is decreased) upon aborts.
+    // Last 32 bits: generation counter that's incremented every time the validation index is decreased.
+    validation_marker: AtomicU64,
+    // Stores number of threads that are currently validating. Used in combination with validation
+    // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
+    // counter would generalize to detect what prefix can be committed.
+    num_validating: AtomicUsize,
+    // Shared marker that's set when a thread detects all txns can be committed - so
+    // other threads can immediately know without expensive checks.
+    done_marker: AtomicUsize,
+
     // Shared number of txns to execute: updated before executing a block or when an error or
     // reconfiguration leads to early stopping (at that transaction version).
     stop_at_version: AtomicUsize,
 
     txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
-    // TODO: Do we need padding here?
-    txn_dependency: Vec<Arc<RwLock<Vec<usize>>>>, // version -> txns that depend on it.
-    txn_status: Vec<AtomicUsize>,                 // version -> execution status.
+    txn_dependency: Vec<CachePadded<Arc<Mutex<Option<Vec<usize>>>>>>, // version -> txns that depend on it.
+    txn_status: Vec<CachePadded<ArcSwap<STMStatus<K, T, E>>>>, // version -> execution status.
 }
 
-impl Scheduler {
+impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     pub fn new(num_txns: usize) -> Self {
         Self {
             execution_marker: AtomicUsize::new(0),
+            validation_marker: AtomicU64::new(0),
+            num_validating: AtomicUsize::new(0),
+            done_marker: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
             txn_buffer: SegQueue::new(),
             txn_dependency: (0..num_txns)
-                .map(|_| Arc::new(RwLock::new(Vec::new())))
+                .map(|_| CachePadded::new(Arc::new(Mutex::new(Some(Vec::new())))))
                 .collect(),
             txn_status: (0..num_txns)
-                .map(|_| AtomicUsize::new(ExecutionStatus::NotExecuted as usize))
+                .map(|_| {
+                    CachePadded::new(ArcSwap::from_pointee(STMStatus::new_before_execution(0)))
+                })
                 .collect(),
+        }
+    }
+
+    fn decrease_validation_marker(&self, target_version: usize) {
+        loop {
+            let val_marker = self.validation_marker.load(Ordering::SeqCst);
+
+            let val_version = val_marker >> 32;
+            if val_version as usize <= target_version {
+                // Already below the desired index, no need to decrease (idx will be validated).
+                return;
+            }
+
+            let new_num_decrease = (val_marker & (1 << 32 - 1)) + 1;
+            // TODO: assert no overflow.
+            let new_marker = ((target_version << 32) as u64) | new_num_decrease;
+
+            if let Ok(_) = self.validation_marker.compare_exchange(
+                val_marker,
+                new_marker,
+                Ordering::SeqCst, // Make sure my decrease is sequentially consistent.
+                Ordering::SeqCst, // Make sure any decrease is ordered before.
+            ) {
+                // Successfully updated.
+                return;
+            }
+        }
+    }
+
+    pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, E>>) -> bool {
+        let stored_ptr = self.txn_status[version].compare_and_swap(
+            cur_status,
+            Arc::new(STMStatus::new_before_execution(cur_status.retry_num() + 1)),
+        );
+
+        if !Arc::ptr_eq(&stored_ptr, cur_status) {
+            // The corresponding re-execution was already aborted, nothing to do.
+            return false;
+        }
+
+        // Successfully aborted.
+        self.decrease_validation_marker(version);
+        true
+    }
+
+    // Return the next txn version & status for the thread to validate.
+    pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
+        loop {
+            let val_marker = self.validation_marker.load(Ordering::Acquire); // status read below.
+
+            let next_to_val = (val_marker >> 32) as usize;
+            if next_to_val >= self.num_txn_to_execute() {
+                return None;
+            }
+            let next_status = self.txn_status[next_to_val].load_full();
+            if !next_status.executed() {
+                // No more transactions or next txn not yet (re-)executed to validate.
+                return None;
+            }
+
+            let num_decrease = val_marker & (1 << 32 - 1);
+            let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
+
+            // Mark that thread is validating next_to_val, else early abort possible.
+            self.num_validating.fetch_add(1, Ordering::SeqCst);
+
+            // CAS to win the competition to actually validate next_to_val.
+            if let Ok(_) = self.validation_marker.compare_exchange(
+                val_marker,
+                new_marker,
+                Ordering::SeqCst, // Keep status stores above.
+                Ordering::Acquire,
+            ) {
+                // CAS successful, return index & status.
+                return Some((next_to_val, next_status));
+            } else {
+                // CAS unsuccessful - not validating next_to_val (will try different index).
+                if self.finish_validation() {
+                    self.check_done();
+                }
+            }
         }
     }
 
@@ -69,29 +253,54 @@ impl Scheduler {
         // the caller usually has just observed the read dependency (so not executed state).
 
         // txn_dependency is initialized for all versions, so unwrap() is safe.
-        let mut stored_deps = self.txn_dependency[dep_version].write().unwrap();
-        if self.txn_status[dep_version].load(Ordering::Acquire)
-            != ExecutionStatus::Executed as usize
-        {
-            stored_deps.push(version);
+        let mut stored_deps = self.txn_dependency[dep_version].lock().unwrap();
+        if !self.txn_status[dep_version].load().executed() {
+            stored_deps.as_mut().unwrap().push(version);
             return true;
         }
         false
     }
 
-    // After txn is executed, add its dependencies to the shared buffer for execution.
-    pub fn finish_execution(&self, version: Version) {
-        self.txn_status[version].store(ExecutionStatus::Executed as usize, Ordering::Release);
-        let mut version_deps: Vec<usize> = {
-            // we want to make things fast inside the lock, so use take instead of clone
-            let mut stored_deps = self.txn_dependency[version].write().unwrap();
-            std::mem::take(&mut stored_deps)
-        };
+    pub fn retry_num(&self, version: usize) -> usize {
+        self.txn_status[version].load().retry_num()
+    }
 
-        version_deps.sort_unstable();
-        for dep in version_deps {
-            self.txn_buffer.push(dep);
+    pub fn output(&self, version: usize) -> ExecutionStatus<T, Error<E>> {
+        self.txn_status[version].load().output()
+    }
+
+    // After txn is executed, add its dependencies to the shared buffer for execution.
+    pub fn finish_execution(
+        &self,
+        version: usize,
+        retry_num: usize,
+        input: Vec<ReadDescriptor<K>>,
+        output: ExecutionStatus<T, Error<E>>,
+    ) {
+        let mut version_deps = Some(Vec::new());
+        // Store is safe because of an invariant that there is at most one execution at a time.
+        self.txn_status[version].store(Arc::new(STMStatus::new_after_execution(
+            retry_num, input, output,
+        )));
+
+        {
+            // we want to make things fast inside the lock, so use replace instead of clone
+            let mut stored_deps = self.txn_dependency[version].lock().unwrap();
+            if !stored_deps.as_mut().unwrap().is_empty() {
+                version_deps = stored_deps.replace(Vec::new());
+            }
         }
+
+        let deps = version_deps.as_mut().unwrap();
+        deps.sort();
+        for dep in deps {
+            self.txn_buffer.push(*dep);
+        }
+    }
+
+    // Returns true if there are no active validators left.
+    pub fn finish_validation(&self) -> bool {
+        self.num_validating.fetch_sub(1, Ordering::SeqCst) == 1
     }
 
     // Reset the txn version/id to end execution earlier. The executor will stop at the smallest
@@ -109,5 +318,34 @@ impl Scheduler {
     // Get the last txn version/id
     pub fn num_txn_to_execute(&self) -> Version {
         self.stop_at_version.load(Ordering::Relaxed)
+    }
+
+    // A lazy, relatively expensive check of whether the scheduler execution is completed.
+    // Updates the 'done_marker' so other threads can know by calling done() function below.
+    // Checks validation marker, takes min of validation index (val marker's first 32 bits)
+    // and thread commit markers. If >= stop_version, re-reads val marker to ensure it
+    // (in particular, gen counter) hasn't changed - otherwise a race is possible.
+    pub fn check_done(&self) {
+        let val_marker = self.validation_marker.load(Ordering::SeqCst);
+
+        let num_txns = self.num_txn_to_execute();
+        let val_version = (val_marker >> 32) as usize;
+        if val_version < num_txns || self.num_validating.load(Ordering::SeqCst) > 0 {
+            // There are txns to validate.
+            return;
+        }
+
+        // Re-read and make sure it hasn't changed. If so, everything can be committed
+        // and set the done flag.
+        if val_marker == self.validation_marker.load(Ordering::SeqCst) {
+            // self.done_marker.store(1, Ordering::SeqCst);
+            self.done_marker.store(1, Ordering::Release);
+        }
+    }
+
+    // Checks whether the done marker is set. The marker can only be set by 'check_done'.
+    pub fn done(&self) -> bool {
+        // self.done_marker.load(Ordering::SeqCst) == 1
+        self.done_marker.load(Ordering::Acquire) == 1
     }
 }

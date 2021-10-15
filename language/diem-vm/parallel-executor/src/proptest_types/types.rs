@@ -230,7 +230,7 @@ where
 
     fn execute_transaction(
         &self,
-        view: &MVHashMapView<K, V>,
+        view: &MVHashMapView<K, V, Self::Output, Self::Error>,
         txn: &Self::T,
     ) -> ExecutionStatus<Self::Output, Self::Error> {
         match txn {
@@ -256,6 +256,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Output<K, V>(Vec<(K, V)>, Vec<Option<V>>);
 
 impl<K, V> TransactionOutput for Output<K, V>

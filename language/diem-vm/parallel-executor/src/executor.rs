@@ -4,7 +4,7 @@
 use crate::{
     errors::*,
     outcome_array::OutcomeArray,
-    scheduler::Scheduler,
+    scheduler::{Scheduler, ReadDescriptor},
     task::{ExecutionStatus, ExecutorTask, ReadWriteSetInferencer, Transaction, TransactionOutput},
 };
 use anyhow::{bail, Result as AResult};
@@ -17,23 +17,43 @@ use std::{
     marker::PhantomData,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
+    collections::HashMap,
 };
 
-pub struct MVHashMapView<'a, K, V> {
+pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
     version: Version,
-    scheduler: &'a Scheduler,
+    scheduler: &'a Scheduler<K, T, E>,
     has_unexpected_read: AtomicBool,
+    reads: Arc<RwLock<HashMap<K, Option<(usize, usize)>>>>,
 }
 
-impl<'a, K: Hash + Clone + Eq, V> MVHashMapView<'a, K, V> {
-    pub fn read(&self, key: &K) -> AResult<Option<&V>> {
+impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: TransactionOutput, E: Send + Clone> MVHashMapView<'a, K, V, T, E> {
+    // Drains the reads.
+    pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
+        self.reads
+            .write()
+            .unwrap()
+            .drain()
+            .map(|(path, version_and_retry_num)| {
+                ReadDescriptor::new(path, version_and_retry_num)
+            })
+            .collect()
+    }
+    
+    pub fn read(&self, key: &K) -> AResult<Option<V>> {
         match self.map.read(key, self.version) {
-            Ok(v) => Ok(Some(v)),
-            Err(None) => Ok(None),
-            Err(Some(dep_idx)) => {
+            Ok((v, version, retry_num)) => {
+                self.reads.write().unwrap().insert(key.clone(), Some((version, retry_num)));
+                return Ok(v);
+            }
+            Err(None) => {
+                self.reads.write().unwrap().insert(key.clone(), None);
+                return Ok(None);
+            }
+            Err(Some((dep_idx, retry_num))) => {
                 // Don't start execution transaction `self.version` until `dep_idx` is computed.
                 if !self.scheduler.add_dependency(self.version, dep_idx) {
                     // dep_idx is already executed, push `self.version` to ready queue.
@@ -126,6 +146,12 @@ where
             let compute_cpus = min(1 + (num_txns / 50), self.num_cpus - 1); // Ensure we have at least 50 tx per thread.
             let compute_cpus = min(num_txns / max_dependency_level, compute_cpus); // Ensure we do not higher rate of conflict than concurrency.
 
+            println!(
+                "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}",
+                compute_cpus,
+                max_dependency_level,
+                scheduler.num_txn_to_execute(),
+            );
             for _ in 0..(compute_cpus) {
                 s.spawn(|_| {
                     let scheduler = Arc::clone(&scheduler);
@@ -138,8 +164,8 @@ where
 
                         // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
                         if txn_accesses.keys_read.iter().any(|k| {
-                            match versioned_data_cache.read(k, idx) {
-                                Err(Some(dep_id)) => scheduler.add_dependency(idx, dep_id),
+                            match versioned_data_cache.read_from_static(k, idx) {
+                                Err(Some((dep_id, _))) => scheduler.add_dependency(idx, dep_id),
                                 Ok(_) | Err(None) => false,
                             }
                         }) {
@@ -155,6 +181,7 @@ where
                             version: idx,
                             scheduler: &scheduler,
                             has_unexpected_read: AtomicBool::new(false),
+                            reads: Arc::new(RwLock::new(HashMap::new())),
                         };
                         let execute_result = task.execute_transaction(&view, txn);
                         if view.has_unexpected_read() {
@@ -163,12 +190,15 @@ where
                             // here.
                             continue;
                         }
+                        
+                        let retry_num = scheduler.retry_num(idx);
+
                         let commit_result =
                             match execute_result {
                                 ExecutionStatus::Success(output) => {
                                     // Commit the side effects to the versioned_data_cache.
                                     if output.get_writes().into_iter().all(|(k, v)| {
-                                        versioned_data_cache.write(&k, idx, v).is_ok()
+                                        versioned_data_cache.write_to_static(&k, idx, retry_num, Some(v)).is_ok()
                                     }) {
                                         ExecutionStatus::Success(output)
                                     } else {
@@ -181,7 +211,7 @@ where
                                 ExecutionStatus::SkipRest(output) => {
                                     // Commit and skip the rest of the transactions.
                                     if output.get_writes().into_iter().all(|(k, v)| {
-                                        versioned_data_cache.write(&k, idx, v).is_ok()
+                                        versioned_data_cache.write_to_static(&k, idx, retry_num, Some(v)).is_ok()
                                     }) {
                                         scheduler.set_stop_version(idx + 1);
                                         ExecutionStatus::SkipRest(output)
@@ -201,10 +231,10 @@ where
 
                         for write in txn_accesses.keys_written.iter() {
                             // Unwrap here is fine because all writes here should be in the mvhashmap.
-                            assert!(versioned_data_cache.skip_if_not_set(write, idx).is_ok());
+                            assert!(versioned_data_cache.skip_if_not_set(write, idx, retry_num).is_ok());
                         }
 
-                        scheduler.finish_execution(idx);
+                        scheduler.finish_execution(idx, retry_num, view.drain_reads(), commit_result.clone());
                         outcomes.set_result(idx, commit_result);
                     }
                 });
@@ -214,13 +244,13 @@ where
         // Splits the head of the vec of results that are valid
         let valid_results_length = scheduler.num_txn_to_execute();
 
-        // Dropping large structures is expensive -- do this is a separate thread.
-        ::std::thread::spawn(move || {
-            drop(scheduler);
-            drop(infer_result);
-            drop(signature_verified_block); // Explicit drops to measure their cost.
-            drop(versioned_data_cache);
-        });
+        // // Dropping large structures is expensive -- do this is a separate thread.
+        // ::std::thread::spawn(move || {
+        //     drop(scheduler);
+        //     drop(infer_result);
+        //     drop(signature_verified_block); // Explicit drops to measure their cost.
+        //     drop(versioned_data_cache);
+        // });
 
         outcomes.get_all_results(valid_results_length)
     }

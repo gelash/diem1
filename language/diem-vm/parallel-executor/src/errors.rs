@@ -1,7 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error<E> {
     /// Invariant violation that happens internally inside of scheduler, usually an indication of
     /// implementation error.
