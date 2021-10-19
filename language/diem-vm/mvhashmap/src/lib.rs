@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use once_cell::sync::OnceCell;
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::{
     cmp::{max, PartialOrd},
     collections::{btree_map::BTreeMap, HashMap},
     fmt::Debug,
     hash::Hash,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::Arc,
 };
 
 #[cfg(test)]
@@ -25,9 +29,10 @@ mod unit_tests;
 
 pub type Version = usize;
 
-pub struct MVHashMap<K, V> {
-    data: HashMap<K, BTreeMap<Version, WriteCell<V>>>,
-}
+const FLAG_UNASSIGNED: usize = 0;
+const FLAG_DONE: usize = 2;
+const FLAG_SKIP: usize = 3;
+const FLAG_DIRTY: usize = 4;
 
 #[derive(Debug)]
 pub enum Error {
@@ -38,32 +43,199 @@ pub enum Error {
 }
 
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
-pub(crate) struct WriteCell<V>(OnceCell<Option<V>>);
+pub(crate) struct WriteCell<V> {
+    flag: AtomicUsize,
+    retry_num: AtomicUsize,
+    data: ArcSwap<Option<V>>,
+}
 
 impl<V> WriteCell<V> {
     pub fn new() -> WriteCell<V> {
-        WriteCell(OnceCell::new())
+        WriteCell {
+            flag: AtomicUsize::new(FLAG_UNASSIGNED),
+            retry_num: AtomicUsize::new(0),
+            data: ArcSwap::from(Arc::new(None)),
+        }
+    }
+
+    pub fn new_from(flag: usize, retry_num: usize, data: Option<V>) -> WriteCell<V> {
+        WriteCell {
+            flag: AtomicUsize::new(flag),
+            retry_num: AtomicUsize::new(retry_num),
+            data: ArcSwap::from(Arc::new(data)),
+        }
     }
 
     pub fn is_assigned(&self) -> bool {
-        self.0.get().is_some()
+        self.flag.load(Ordering::SeqCst) == FLAG_DONE
     }
 
-    pub fn write(&self, v: V) {
-        // Each cell should only be written exactly once.
-        assert!(self.0.set(Some(v)).is_ok())
+    pub fn write(&self, v: Option<V>, retry_num: usize) {
+        self.data.store(Arc::new(v));
+        self.retry_num.store(retry_num, Ordering::SeqCst);
+        self.flag.store(FLAG_DONE, Ordering::SeqCst);
     }
 
-    pub fn skip(&self) {
-        assert!(self.0.set(None).is_ok());
+    pub fn skip(&self, retry_num: usize) {
+        self.flag.store(FLAG_SKIP, Ordering::SeqCst);
+        self.retry_num.store(retry_num, Ordering::SeqCst);
     }
 
-    pub fn get(&self) -> Option<&Option<V>> {
-        self.0.get()
+    // pub fn get(&self) -> Option<&Option<V>> {
+    //     self.0.get()
+    // }
+}
+
+pub struct StaticMVHashMap<K, V> {
+    data: HashMap<K, BTreeMap<Version, WriteCell<V>>>,
+}
+
+pub struct DynamicMVHashMap<K, V> {
+    empty: AtomicUsize,
+    data: Arc<DashMap<K, BTreeMap<Version, WriteCell<V>>>>,
+}
+
+pub struct MVHashMap<K, V> {
+    s_mvhashmap: StaticMVHashMap<K, V>,
+    d_mvhashmap: DynamicMVHashMap<K, V>,
+}
+
+impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send>
+    MVHashMap<K, V>
+{
+    pub fn new_from_parallel(
+        possible_writes: Vec<(K, Version)>,
+    ) -> (MVHashMap<K, V>, usize) {
+        let (s_mvhashmap, max_dependency_length) =
+            StaticMVHashMap::new_from_parallel(possible_writes);
+        let d_mvhashmap = DynamicMVHashMap::new();
+        (
+            MVHashMap {
+                s_mvhashmap,
+                d_mvhashmap,
+            },
+            max_dependency_length,
+        )
+    }
+
+    // For the entry of same verison/txn_id, it should only appear in only one mvhashmap since a write is either estimated or non-estimated
+    // Return the higher version data ranked by version, if read data from both mvhashmaps
+    // If read both dependency and data, return the higher version
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        // reads may return Ok((Option<V>, Version, retry_num)), Err(Some(Version)) or Err(None)
+        let read_from_static = self.s_mvhashmap.read(key, version);
+        let read_from_dynamic = self.d_mvhashmap.read(key, version);
+
+        // Should return the dependency or data of the higher version
+        let version1 = match read_from_static {
+            Ok((_, version, _)) => Some(version),
+            Err(Some((version, _))) => Some(version),
+            Err(None) => None,
+        };
+        let version2 = match read_from_dynamic {
+            Ok((_, version, _)) => Some(version),
+            Err(Some((version, _))) => Some(version),
+            Err(None) => None,
+        };
+        // If both mvhashmaps do not contain AP, return Err(None)
+        if version1.is_none() && version2.is_none() {
+            return Err(None);
+        }
+        if version1.is_some() && version2.is_some() {
+            // The same version should not be appear in both static and dynamic mvhashmaps
+            assert_ne!(version1.unwrap(), version2.unwrap());
+            if version1.unwrap() > version2.unwrap() {
+                return read_from_static;
+            } else {
+                return read_from_dynamic;
+            }
+        }
+        if version1.is_none() {
+            return read_from_dynamic;
+        } else {
+            return read_from_static;
+        }
+    }
+
+    pub fn read_from_static(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        self.s_mvhashmap.read(key, version)
+    }
+
+    pub fn read_from_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        self.d_mvhashmap.read(key, version)
+    }
+
+    pub fn write_to_static(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), Error> {
+        self.s_mvhashmap.write(key, version, retry_num, data)
+    }
+
+    pub fn write_to_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
+        self.d_mvhashmap.write(key, version, retry_num, data)
+    }
+
+    pub fn set_dirty_to_static(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), Error> {
+        self.s_mvhashmap.set_dirty(key, version, retry_num)
+    }
+
+    pub fn set_dirty_to_dynamic(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), ()> {
+        self.d_mvhashmap.set_dirty(key, version, retry_num)
+    }
+
+    pub fn dynamic_empty(&self) -> bool {
+        self.d_mvhashmap.empty()
+    }
+
+    pub fn skip(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+        self.s_mvhashmap.skip(key, version, retry_num)
+    }
+
+    pub fn skip_if_not_set(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+        self.s_mvhashmap.skip_if_not_set(key, version, retry_num)
+    }
+
+    // returns (max depth, avg depth) of dynamic hashmap
+    pub fn get_depth(&self) -> ((usize, usize), (usize, usize)) {
+        let s_depths = self.s_mvhashmap.get_depth();
+        let d_depths = self.d_mvhashmap.get_depth();
+        return (s_depths, d_depths);
     }
 }
 
-impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
+impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
     /// Create the MVHashMap structure from a list of possible writes. Each element in the list
     /// indicates a key that could potentially be modified at its given version.
     ///
@@ -80,7 +252,7 @@ impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
             .values()
             .fold(0, |max_depth, btree_map| max(max_depth, btree_map.len()));
 
-        (MVHashMap { data: outer_map }, max_dependency_size)
+        (StaticMVHashMap { data: outer_map }, max_dependency_size)
     }
 
     /// Get the number of keys in the MVHashMap.
@@ -98,36 +270,29 @@ impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
 
     /// Write to `key` at `version`.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn write(&self, key: &K, version: Version, data: V) -> Result<(), Error> {
+    pub fn write(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), Error> {
         // By construction there will only be a single writer, before the
         // write there will be no readers on the variable.
         // So it is safe to go ahead and write without any further check.
 
         let entry = self.get_entry(key, version)?;
 
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            if entry.is_assigned() {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
-
-        entry.write(data);
+        entry.write(data, retry_num);
 
         Ok(())
     }
 
     /// Skips writing to `key` at `version` if that entry hasn't been assigned.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn skip_if_not_set(&self, key: &K, version: Version) -> Result<(), Error> {
+    pub fn skip_if_not_set(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
         // We only write or skip once per entry
         // So it is safe to go ahead and just do it.
         let entry = self.get_entry(key, version)?;
 
-        // Test the invariant holds
-        if !entry.is_assigned() {
-            entry.skip();
+        let flag = entry.flag.load(Ordering::SeqCst);
+        let retry = entry.retry_num.load(Ordering::SeqCst);
+        if (retry < retry_num) || (retry == retry_num && flag != FLAG_DONE) {
+            entry.skip(retry_num);
         }
 
         Ok(())
@@ -136,20 +301,18 @@ impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
     /// Skips writing to `key` at `version`.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
     /// `skip` should only be invoked when `key` at `version` hasn't been assigned.
-    pub fn skip(&self, key: &K, version: Version) -> Result<(), Error> {
-        // We only write or skip once per entry
-        // So it is safe to go ahead and just do it.
+    pub fn skip(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
         let entry = self.get_entry(key, version)?;
 
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            if entry.is_assigned() {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
+        entry.skip(retry_num);
+        Ok(())
+    }
 
-        entry.skip();
+    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+        let entry = self.get_entry(key, version)?;
+
+        entry.flag.store(FLAG_DIRTY, Ordering::SeqCst);
+        entry.retry_num.store(retry_num, Ordering::SeqCst);
         Ok(())
     }
 
@@ -157,33 +320,62 @@ impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
     /// Returns Ok(val) if such key is already assigned by previous transactions.
     /// Returns Err(None) if `version` is smaller than the write of all previous versions.
     /// Returns Err(Some(version)) if such key is dependent on the `version`-th transaction.
-    pub fn read(&self, key: &K, version: Version) -> Result<&V, Option<Version>> {
+    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         let tree = self.data.get(key).ok_or(None)?;
 
         let mut iter = tree.range(0..version);
 
         while let Some((entry_key, entry_val)) = iter.next_back() {
             if *entry_key < version {
-                match entry_val.get() {
-                    // Entry not yet computed, return the version that blocked this query.
-                    None => return Err(Some(*entry_key)),
-                    // Entry is skipped, go to previous version.
-                    Some(None) => continue,
-                    Some(Some(v)) => return Ok(v),
+                let flag = entry_val.flag.load(Ordering::SeqCst);
+                let retry = entry_val.retry_num.load(Ordering::SeqCst);
+                
+                // Entry not yet computed, return the version that blocked this query.
+                if flag == FLAG_UNASSIGNED || flag == FLAG_DIRTY {
+                    return Err(Some((*entry_key, retry)));
                 }
+
+                // Entry is skipped, go to previous version.
+                if flag == FLAG_SKIP {
+                    continue;
+                }
+
+                // The entry is populated so return its contents
+                if flag == FLAG_DONE {
+                    return Ok(((**entry_val.data.load()).clone(), *entry_key, retry));
+                }
+
+                unreachable!();
             }
         }
 
         Err(None)
     }
+
+    // returns (max depth, avg depth) of static hashmap
+    pub fn get_depth(&self) -> (usize, usize) {
+        if self.data.is_empty() {
+            return (0, 0);
+        }
+        let mut max = 0;
+        let mut sum = 0;
+        for (_, map) in self.data.iter() {
+            let size = map.len();
+            sum += size;
+            if size > max {
+                max = size;
+            }
+        }
+        return (max, sum / self.data.len());
+    }
 }
 
 const PARALLEL_THRESHOLD: usize = 1000;
 
-impl<K, V> MVHashMap<K, V>
+impl<K, V> StaticMVHashMap<K, V>
 where
     K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Send,
+    V: Send + Sync,
 {
     fn split_merge(
         num_cpus: usize,
@@ -218,6 +410,111 @@ where
         let num_cpus = num_cpus::get();
 
         let (max_dependency_len, data) = Self::split_merge(num_cpus, 0, possible_writes);
-        (MVHashMap { data }, max_dependency_len)
+        (StaticMVHashMap { data }, max_dependency_len)
+    }
+}
+
+
+impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
+    pub fn new() -> DynamicMVHashMap<K, V> {
+        DynamicMVHashMap {
+            empty: AtomicUsize::new(1),
+            data: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn write(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), ()> {
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            self.empty.store(0, Ordering::SeqCst);
+        }
+        let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
+        map.insert(
+            version,
+            WriteCell::new_from(FLAG_DONE, retry_num, data),
+        );
+
+        Ok(())
+    }
+
+    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            self.empty.store(0, Ordering::SeqCst);
+        }
+        let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
+        map.insert(
+            version,
+            WriteCell::new_from(FLAG_DIRTY, retry_num, None),
+        );
+
+        Ok(())
+    }
+
+    // read when using Btree, may return Ok((Option<V>, Version, retry_num)), Err(Some(Version)) or Err(None)
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            return Err(None);
+        }
+        match self.data.get(key) {
+            Some(tree) => {
+                // Find the dependency
+                let mut iter = tree.range(0..version);
+                while let Some((entry_key, entry_val)) = iter.next_back() {
+                    if *entry_key < version {
+                        let flag = entry_val.flag.load(Ordering::SeqCst);
+
+                        if flag == FLAG_DIRTY {
+                            continue;
+                        }
+
+                        // The entry is populated so return its contents
+                        if flag == FLAG_DONE {
+                            return Ok((
+                                (**entry_val.data.load()).clone(),
+                                *entry_key,
+                                entry_val.retry_num.load(Ordering::SeqCst),
+                            ));
+                        }
+
+                        unreachable!();
+                    }
+                }
+                return Err(None);
+            }
+            None => {
+                return Err(None);
+            }
+        }
+    }
+
+    pub fn empty(&self) -> bool {
+        self.empty.load(Ordering::SeqCst) == 1
+    }
+
+    // returns (max depth, avg depth) of dynamic hashmap
+    pub fn get_depth(&self) -> (usize, usize) {
+        if self.empty.load(Ordering::SeqCst) == 1 {
+            return (0, 0);
+        }
+        let mut max = 0;
+        let mut sum = 0;
+        for item in self.data.iter() {
+            let map = &*item;
+            let size = map.len();
+            sum += size;
+            if size > max {
+                max = size;
+            }
+        }
+        return (max, sum / self.data.len());
     }
 }

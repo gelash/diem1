@@ -96,7 +96,7 @@ where
         .collect::<Vec<_>>();
 
     let baseline = Baseline::new(transactions.as_slice());
-    let (map, _) = MVHashMap::<K, Option<V>>::new_from_parallel(versions_to_write);
+    let (map, _) = StaticMVHashMap::<K, Option<V>>::new_from_parallel(versions_to_write);
     let curent_idx = AtomicUsize::new(0);
 
     // Spawn a few threads in parallel to commit each operator.

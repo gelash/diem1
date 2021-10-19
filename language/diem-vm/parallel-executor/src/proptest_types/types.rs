@@ -20,6 +20,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
 };
+use rand::Rng;
 
 ///////////////////////////////////////////////////////////////////////////
 // Generation of transactions
@@ -202,6 +203,63 @@ where
     }
 }
 
+pub struct STMInferencer<K, V>(PhantomData<(K, V)>, f64, f64);
+
+impl<K, V> STMInferencer<K, V> {
+    pub fn new(drop_write: f64, drop_read: f64) -> Self {
+        Self(PhantomData, drop_write, drop_read)
+    }
+}
+
+impl<K, V> ReadWriteSetInferencer for STMInferencer<K, V>
+where
+    K: PartialOrd + Send + Sync + Clone + Hash + Eq + 'static,
+    V: Send + Sync + Debug + Clone + 'static,
+{
+    type T = Transaction<K, V>;
+
+    fn infer_reads_writes(&self, txn: &Self::T) -> AResult<Accesses<K>> {
+        match txn {
+            Transaction::Write {
+                actual_writes,
+                skipped_writes,
+                reads,
+            } => {
+                let mut writes = actual_writes
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .collect::<Vec<_>>();
+                writes.append(&mut skipped_writes.clone());
+
+                let mut writes_result = Vec::new();
+                let mut reads_result = Vec::new();
+                let mut rng = rand::thread_rng(); // randomness
+                
+                for write in writes {
+                    if rng.gen_range(0.0..10.0) / 10.0 > self.1 {
+                        writes_result.push(write.clone());
+                    }
+                }
+
+                for read in reads {
+                    if rng.gen_range(0.0..10.0) / 10.0 > self.2 {
+                        reads_result.push(read.clone());
+                    }
+                }
+
+                Ok(Accesses {
+                    keys_read: reads_result,
+                    keys_written: writes_result,
+                })
+            }
+            Transaction::SkipRest | Transaction::Abort => Ok(Accesses {
+                keys_read: vec![],
+                keys_written: vec![],
+            }),
+        }
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Naive transaction executor implementation.
 ///////////////////////////////////////////////////////////////////////////
@@ -256,7 +314,7 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Output<K, V>(Vec<(K, V)>, Vec<Option<V>>);
 
 impl<K, V> TransactionOutput for Output<K, V>
@@ -280,13 +338,14 @@ where
 ///////////////////////////////////////////////////////////////////////////
 
 /// Sequential baseline of execution result for dummy transaction.
+#[derive(Debug)]
 pub enum ExpectedOutput<V> {
     Aborted(usize),
     SkipRest(usize, Vec<Vec<Option<V>>>),
     Success(Vec<Vec<Option<V>>>),
 }
 
-impl<V: Clone + Eq> ExpectedOutput<V> {
+impl<V: Clone + Eq + Debug> ExpectedOutput<V> {
     pub fn generate_baseline<K: Hash + Clone + Eq>(txns: &[Transaction<K, V>]) -> Self {
         let mut current_world = HashMap::new();
         let mut result_vec = vec![];
@@ -330,7 +389,16 @@ impl<V: Clone + Eq> ExpectedOutput<V> {
             (Self::Success(expected_results), Ok(results)) => expected_results
                 .iter()
                 .zip(results.iter())
-                .all(|(expected_result, Output(_, result))| expected_result == result),
+                .all(|(expected_result, Output(_, result))| {
+                    if expected_result == result {
+                        return true;
+                    } else {
+                        println!("expect: {:?}", expected_result);
+                        println!("result: {:?}\n", result);
+                        return false;
+                    }
+                    // return expected_result == result;
+                }),
             _ => false,
         }
     }

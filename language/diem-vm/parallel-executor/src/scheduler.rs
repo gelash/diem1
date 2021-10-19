@@ -25,11 +25,11 @@ pub struct ReadDescriptor<K> {
 
     // Is set to (version, retry_num) if the read was from shared MV data-structure
     // (written by a previous txn), None if read from storage.
-    version_and_retry_num: Option<(usize, usize)>, // TODO: Version alias for usize.
+    version_and_retry_num: Option<(bool, usize, usize)>, // TODO: Version alias for usize.
 }
 
 impl<K> ReadDescriptor<K> {
-    pub fn new(access_path: K, version_and_retry_num: Option<(usize, usize)>) -> Self {
+    pub fn new(access_path: K, version_and_retry_num: Option<(bool, usize, usize)>) -> Self {
         Self {
             access_path,
             version_and_retry_num,
@@ -40,7 +40,7 @@ impl<K> ReadDescriptor<K> {
         &self.access_path
     }
 
-    pub fn validate(&self, new_version_and_retry_num: Option<(usize, usize)>) -> bool {
+    pub fn validate(&self, new_version_and_retry_num: Option<(bool, usize, usize)>) -> bool {
         self.version_and_retry_num == new_version_and_retry_num
     }
 }
@@ -90,11 +90,16 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
         &self.input_output.as_ref().unwrap().0
     }
 
-    // // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
-    // pub fn write_set(&self) -> &Vec<(<<T as TransactionOutput>::T as Transaction>::Key, <<T as TransactionOutput>::T as Transaction>::Value)> {
-    //     let output = &self.input_output.as_ref().unwrap().1;
-    //     &output.get_writes()
-    // }
+    // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
+    pub fn write_set(&self) -> Vec<(<<T as TransactionOutput>::T as Transaction>::Key, <<T as TransactionOutput>::T as Transaction>::Value)> {
+        let output = &self.input_output.as_ref().unwrap().1;
+        let t = match output {
+            ExecutionStatus::Success(t) => t,
+            ExecutionStatus::SkipRest(t) => t,
+            ExecutionStatus::Abort(err) => return Vec::new(),
+        };
+        return t.get_writes();
+    }
 
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
         self.input_output.as_ref().unwrap().1.clone()
@@ -111,7 +116,7 @@ pub struct Scheduler<K, T, E> {
     // Stores number of threads that are currently validating. Used in combination with validation
     // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
     // counter would generalize to detect what prefix can be committed.
-    num_validating: AtomicUsize,
+    pub num_validating: AtomicUsize,
     // Shared marker that's set when a thread detects all txns can be committed - so
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
@@ -338,6 +343,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
+            println!("val_version {} num_txns {}", val_version, num_txns);
             // self.done_marker.store(1, Ordering::SeqCst);
             self.done_marker.store(1, Ordering::Release);
         }
