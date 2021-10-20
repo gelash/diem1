@@ -386,19 +386,32 @@ impl<V: Clone + Eq + Debug> ExpectedOutput<V> {
                         .skip(*skip_at)
                         .all(|Output(_, result)| result.is_empty())
             }
-            (Self::Success(expected_results), Ok(results)) => expected_results
-                .iter()
-                .zip(results.iter())
-                .all(|(expected_result, Output(_, result))| {
-                    if expected_result == result {
-                        return true;
-                    } else {
+            (Self::Success(expected_results), Ok(results)) => {
+                for id in 0..expected_results.len() {
+                    let expected_result = &expected_results[id];
+                    let Output(_, result) = &results[id];
+                    if expected_result != result {
+                        println!("Transaction id {}", id);
                         println!("expect: {:?}", expected_result);
                         println!("result: {:?}\n", result);
                         return false;
                     }
-                    // return expected_result == result;
-                }),
+                }
+                return true;
+            }
+                // expected_results
+                // .iter()
+                // .zip(results.iter())
+                // .all(|(expected_result, Output(_, result))| {
+                //     if expected_result == result {
+                //         return true;
+                //     } else {
+                //         println!("expect: {:?}", expected_result);
+                //         println!("result: {:?}\n", result);
+                //         return false;
+                //     }
+                //     // return expected_result == result;
+                // }),
             _ => false,
         }
     }
