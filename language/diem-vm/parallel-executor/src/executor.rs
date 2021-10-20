@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicUsize, AtomicBool, Ordering},
         Arc, RwLock, Mutex,
     },
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     iter::FromIterator,
     time::{Duration, Instant},
     hint,
@@ -30,54 +30,49 @@ pub struct MVHashMapView<'a, K, V, T, E> {
     version: Version,
     scheduler: &'a Scheduler<K, T, E>,
     has_unexpected_read: AtomicBool,
-    reads: Arc<RwLock<Vec<(K, Option<(bool, usize, usize)>)>>>,
+    reads: Arc<Mutex<Vec<ReadDescriptor<K>>>>,
 }
 
 impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: TransactionOutput, E: Send + Clone> MVHashMapView<'a, K, V, T, E> {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
-        self.reads
-            .write()
-            .unwrap()
-            .iter()
-            .map(|(path, version_and_retry_num)| {
-                ReadDescriptor::new(path.clone(), version_and_retry_num.clone())
-            })
-            .collect()
+        let mut reads = self.reads.lock().unwrap();
+        std::mem::take(&mut reads)
     }
     
     pub fn read(&self, key: &K) -> AResult<Option<V>> {
-        match self.map.read(key, self.version) {
-            Ok((v, version, retry_num)) => {
-                self.reads.write().unwrap().push((key.clone(), Some((true, version, retry_num))));
-                return Ok(v);
-            }
-            Err(None) => {
-                self.reads.write().unwrap().push((key.clone(), None));
-                return Ok(None);
-            }
-            Err(Some((dep_idx, retry_num))) => {
-                self.reads.write().unwrap().push((key.clone(), Some((false, dep_idx, retry_num))));
-                // Don't start execution transaction `self.version` until `dep_idx` is computed.
-                if !self.scheduler.add_dependency(self.version, dep_idx) {
-                    // dep_idx is already executed, push `self.version` to ready queue.
-                    self.scheduler.add_transaction(self.version);
+        loop {
+            match self.map.read(key, self.version) {
+                Ok((v, version, retry_num)) => {
+                    self.reads.lock().unwrap().push(ReadDescriptor::new(key.clone(), Some((version, retry_num))));
+                    return Ok(v);
                 }
-                self.has_unexpected_read.fetch_or(true, Ordering::Relaxed);
-                bail!("Read dependency is not computed, retry later")
-            }
+                Err(None) => {
+                    self.reads.lock().unwrap().push(ReadDescriptor::new(key.clone(), None));
+                    return Ok(None);
+                }
+                Err(Some((dep_idx, _retry_num))) => {
+                    // Don't start execution transaction `self.version` until `dep_idx` is computed.
+                    if self.scheduler.add_dependency(self.version, dep_idx) {
+                        // dep_idx is already executed, push `self.version` to ready queue.
+                        // self.scheduler.add_transaction(self.version);
+                        self.has_unexpected_read.store(true, Ordering::Relaxed);
+                        bail!("Read dependency is not computed, retry later")
+                    }
+                }
+            };
         }
     }
 
     // Return a (true, version, retry_num) if the read returns a value, 
     // or (false, version, retry_num) if read dependency, otherwise return None.
-    pub fn read_version_and_retry_num(&self, access_path: &K) -> Option<(bool, usize, usize)> {
+    pub fn read_version_and_retry_num(&self, access_path: &K) -> Option<(usize, usize)> {
         // reads may return Ok((Option<V>, version, retry_num) when there is value and no read dependency
         // or Err(Some<version, retry_num>) when there is read dependency
         // or Err(None) when there is no value and no read dependency
         match self.map.read(access_path, self.version) {
-            Ok((_, version, retry_num)) => Some((true, version, retry_num)),
-            Err(Some((version, retry_num))) => Some((false, version, retry_num)),
+            Ok((_, version, retry_num)) => Some((version, retry_num)),
+            Err(Some((version, retry_num))) => Some((version, retry_num)),
             Err(None) => None,
         }
     }
@@ -271,7 +266,7 @@ where
                                 version: version_to_validate,
                                 scheduler: &scheduler,
                                 has_unexpected_read: AtomicBool::new(false),
-                                reads: Arc::new(RwLock::new(Vec::new())),
+                                reads: Arc::new(Mutex::new(Vec::new())),
                             };
 
                             let read_timer = Instant::now();
@@ -345,7 +340,7 @@ where
                             version: txn_to_execute,
                             scheduler: &scheduler,
                             has_unexpected_read: AtomicBool::new(false),
-                            reads: Arc::new(RwLock::new(Vec::new())),
+                            reads: Arc::new(Mutex::new(Vec::new())),
                         };
 
                         let txn_accesses = &infer_result[txn_to_execute];

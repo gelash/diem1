@@ -25,11 +25,11 @@ pub struct ReadDescriptor<K> {
 
     // Is set to (version, retry_num) if the read was from shared MV data-structure
     // (written by a previous txn), None if read from storage.
-    version_and_retry_num: Option<(bool, usize, usize)>, // TODO: Version alias for usize.
+    version_and_retry_num: Option<(usize, usize)>, // TODO: Version alias for usize.
 }
 
 impl<K> ReadDescriptor<K> {
-    pub fn new(access_path: K, version_and_retry_num: Option<(bool, usize, usize)>) -> Self {
+    pub fn new(access_path: K, version_and_retry_num: Option<(usize, usize)>) -> Self {
         Self {
             access_path,
             version_and_retry_num,
@@ -40,7 +40,7 @@ impl<K> ReadDescriptor<K> {
         &self.access_path
     }
 
-    pub fn validate(&self, new_version_and_retry_num: Option<(bool, usize, usize)>) -> bool {
+    pub fn validate(&self, new_version_and_retry_num: Option<(usize, usize)>) -> bool {
         self.version_and_retry_num == new_version_and_retry_num
     }
 }
@@ -126,7 +126,7 @@ pub struct Scheduler<K, T, E> {
     stop_at_version: AtomicUsize,
 
     txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
-    txn_dependency: Vec<CachePadded<Arc<Mutex<Option<Vec<usize>>>>>>, // version -> txns that depend on it.
+    txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
     txn_status: Vec<CachePadded<ArcSwap<STMStatus<K, T, E>>>>, // version -> execution status.
 }
 
@@ -140,7 +140,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             stop_at_version: AtomicUsize::new(num_txns),
             txn_buffer: SegQueue::new(),
             txn_dependency: (0..num_txns)
-                .map(|_| CachePadded::new(Arc::new(Mutex::new(Some(Vec::new())))))
+                .map(|_| Arc::new(Mutex::new(Vec::new())))
                 .collect(),
             txn_status: (0..num_txns)
                 .map(|_| {
@@ -259,8 +259,9 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
         // txn_dependency is initialized for all versions, so unwrap() is safe.
         let mut stored_deps = self.txn_dependency[dep_version].lock().unwrap();
-        if !self.txn_status[dep_version].load().executed() {
-            stored_deps.as_mut().unwrap().push(version);
+        if !self.txn_status[dep_version].load().executed()
+        {
+            stored_deps.push(version);
             return true;
         }
         false
@@ -282,24 +283,21 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
     ) {
-        let mut version_deps = Some(Vec::new());
         // Store is safe because of an invariant that there is at most one execution at a time.
         self.txn_status[version].store(Arc::new(STMStatus::new_after_execution(
             retry_num, input, output,
         )));
 
-        {
-            // we want to make things fast inside the lock, so use replace instead of clone
+        // we want to make things fast inside the lock, so use replace instead of clone
+        let mut version_deps: Vec<usize> = {
+            // we want to make things fast inside the lock, so use take instead of clone
             let mut stored_deps = self.txn_dependency[version].lock().unwrap();
-            if !stored_deps.as_mut().unwrap().is_empty() {
-                version_deps = stored_deps.replace(Vec::new());
-            }
-        }
+            std::mem::take(&mut stored_deps)
+        };
 
-        let deps = version_deps.as_mut().unwrap();
-        deps.sort();
-        for dep in deps {
-            self.txn_buffer.push(*dep);
+        version_deps.sort_unstable();
+        for dep in version_deps {
+            self.txn_buffer.push(dep);
         }
     }
 
@@ -315,10 +313,10 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             .fetch_min(stop_version, Ordering::Relaxed);
     }
 
-    // Adding version to the ready queue.
-    pub fn add_transaction(&self, version: Version) {
-        self.txn_buffer.push(version)
-    }
+    // // Adding version to the ready queue.
+    // pub fn add_transaction(&self, version: Version) {
+    //     self.txn_buffer.push(version)
+    // }
 
     // Get the last txn version/id
     pub fn num_txn_to_execute(&self) -> Version {
