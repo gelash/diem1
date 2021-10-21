@@ -3,23 +3,29 @@
 
 use crate::{
     executor::ParallelTransactionExecutor,
-    proptest_types::types::{ExpectedOutput, Inferencer, Task, Transaction},
+    proptest_types::types::{ExpectedOutput, Inferencer, STMInferencer, Task, Transaction},
 };
 use rand::random;
 use std::{fmt::Debug, hash::Hash};
 
-fn run_and_assert<K, V>(transactions: Vec<Transaction<K, V>>)
+fn run_and_assert<K, V>(transactions: Vec<Transaction<K, V>>, imprecise_write_and_read: bool)
 where
     K: PartialOrd + Send + Sync + Clone + Hash + Eq + 'static,
     V: Send + Sync + Debug + Clone + Eq + 'static,
 {
     let baseline = ExpectedOutput::generate_baseline(&transactions);
 
-    let output =
+    let output = if imprecise_write_and_read {
+        ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, STMInferencer<K, V>>::new(
+            STMInferencer::new(0.5, 0.5),
+        )
+        .execute_transactions_parallel((), transactions)
+    } else {
         ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, Inferencer<K, V>>::new(
             Inferencer::new(),
         )
-        .execute_transactions_parallel((), transactions);
+        .execute_transactions_parallel((), transactions)
+    };
 
     assert!(baseline.check_output(&output))
 }
@@ -42,7 +48,7 @@ fn cycle_transactions() {
             })
         }
     }
-    run_and_assert(transactions)
+    run_and_assert(transactions, true)
 }
 
 const NUM_BLOCKS: u64 = 10;
@@ -67,7 +73,7 @@ fn one_reads_all_barrier() {
             skipped_writes: vec![],
         })
     }
-    run_and_assert(transactions)
+    run_and_assert(transactions, true)
 }
 
 #[test]
@@ -92,7 +98,7 @@ fn one_writes_all_barrier() {
             skipped_writes: vec![],
         })
     }
-    run_and_assert(transactions)
+    run_and_assert(transactions, true)
 }
 
 #[test]
@@ -111,7 +117,7 @@ fn early_aborts() {
         // One transaction that triggers an abort
         transactions.push(Transaction::Abort)
     }
-    run_and_assert(transactions)
+    run_and_assert(transactions, true)
 }
 
 #[test]
@@ -130,5 +136,5 @@ fn early_skips() {
         // One transaction that triggers an abort
         transactions.push(Transaction::SkipRest)
     }
-    run_and_assert(transactions)
+    run_and_assert(transactions, true)
 }

@@ -11,7 +11,7 @@ use proptest::prelude::*;
 
 fn random_benches(c: &mut Criterion) {
     c.bench_function("random_benches", |b| {
-        let bencher = Bencher::<[u8; 1], [u8; 1]>::new(10000, 2, 0.5, 0.0); // number of txns, number of accounts, percentage of unestimated write, percentage of unestimated read
+        let bencher = Bencher::<[u8; 1], [u8; 1]>::new(30, 2, 1.0, 0.0); // number of txns, number of accounts, percentage of unestimated write, percentage of unestimated read
         bencher.bench(&any::<[u8; 1]>(), b)
     });
 }

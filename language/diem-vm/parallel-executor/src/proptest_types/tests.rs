@@ -4,7 +4,7 @@
 use crate::{
     executor::ParallelTransactionExecutor,
     proptest_types::types::{
-        ExpectedOutput, ImpreciseInferencer, Inferencer, Task, Transaction, TransactionGen,
+        ExpectedOutput, ImpreciseInferencer, Inferencer, STMInferencer, Task, Transaction, TransactionGen,
     },
 };
 use proptest::{collection::vec, prelude::*, sample::Index, strategy::Strategy};
@@ -16,6 +16,7 @@ fn run_transactions<K, V>(
     abort_transactions: Vec<Index>,
     skip_rest_transactions: Vec<Index>,
     imprecise_read: bool,
+    imprecise_write_and_read: bool,
 ) -> bool
 where
     K: Hash + Clone + Debug + Eq + Send + Sync + PartialOrd + Ord + 'static,
@@ -38,17 +39,25 @@ where
 
     let baseline = ExpectedOutput::generate_baseline(&transactions);
 
-    let output = if imprecise_read {
-        ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, ImpreciseInferencer<K, V>>::new(
-            ImpreciseInferencer::new(),
-        )
-            .execute_transactions_parallel((), transactions)
-    } else {
-        ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, Inferencer<K, V>>::new(
-            Inferencer::new(),
+    let output = if imprecise_write_and_read {
+        ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, STMInferencer<K, V>>::new(
+            STMInferencer::new(0.5, 0.5),
         )
         .execute_transactions_parallel((), transactions)
+    } else {
+        if imprecise_read {
+            ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, ImpreciseInferencer<K, V>>::new(
+                ImpreciseInferencer::new(),
+            )
+                .execute_transactions_parallel((), transactions)
+        } else {
+            ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, Inferencer<K, V>>::new(
+                Inferencer::new(),
+            )
+            .execute_transactions_parallel((), transactions)
+        }
     };
+    
 
     baseline.check_output(&output)
 }
@@ -62,7 +71,7 @@ proptest! {
         abort_transactions in vec(any::<Index>(), 0),
         skip_rest_transactions in vec(any::<Index>(), 0),
     ) {
-        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false));
+        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false, true));
     }
 
     #[test]
@@ -72,7 +81,7 @@ proptest! {
         abort_transactions in vec(any::<Index>(), 5),
         skip_rest_transactions in vec(any::<Index>(), 0),
     ) {
-        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false));
+        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false, true));
     }
 
     #[test]
@@ -82,7 +91,7 @@ proptest! {
         abort_transactions in vec(any::<Index>(), 0),
         skip_rest_transactions in vec(any::<Index>(), 5),
     ) {
-        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false));
+        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false, true));
     }
 
 
@@ -93,7 +102,7 @@ proptest! {
         abort_transactions in vec(any::<Index>(), 5),
         skip_rest_transactions in vec(any::<Index>(), 5),
     ) {
-        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false));
+        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, false, true));
     }
 
     #[test]
@@ -103,6 +112,6 @@ proptest! {
         abort_transactions in vec(any::<Index>(), 5),
         skip_rest_transactions in vec(any::<Index>(), 5),
     ) {
-        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, true));
+        prop_assert!(run_transactions(universe, transaction_gen, abort_transactions, skip_rest_transactions, true, true));
     }
 }
