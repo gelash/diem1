@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::{fmt::Debug, hash::Hash};
 
 /// The execution result of a transaction
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecutionStatus<T, E> {
     /// Transaction was executed successfully.
     Success(T),
@@ -22,7 +22,7 @@ pub enum ExecutionStatus<T, E> {
 /// transaction will write to a key value storage as their side effect.
 pub trait Transaction: Sync + Send + 'static {
     type Key: PartialOrd + Send + Sync + Clone + Hash + Eq;
-    type Value: Send + Sync;
+    type Value: Send + Sync + Clone;
 }
 
 /// Inference result of a transaction.
@@ -69,13 +69,13 @@ pub trait ExecutorTask: Sync {
     /// Execute one single transaction given the view of the current state.
     fn execute_transaction(
         &self,
-        view: &MVHashMapView<<Self::T as Transaction>::Key, <Self::T as Transaction>::Value>,
+        view: &MVHashMapView<<Self::T as Transaction>::Key, <Self::T as Transaction>::Value, Self::Output, Self::Error>,
         txn: &Self::T,
     ) -> ExecutionStatus<Self::Output, Self::Error>;
 }
 
 /// Trait for execution result of a transaction.
-pub trait TransactionOutput: Send + Sync {
+pub trait TransactionOutput: Send + Sync + Clone {
     /// Type of transaction and its associated key and value.
     type T: Transaction;
 
