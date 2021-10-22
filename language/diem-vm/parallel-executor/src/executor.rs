@@ -298,12 +298,16 @@ where
                                 version_to_execute = Some(version_to_validate);
 
                                 revalidation_counter.fetch_add(1, Ordering::Relaxed);
+                                // println!("txn {} validation failed and aborted!", version_to_validate);
                             }
 
                             last_validator_no_work = scheduler.finish_validation();
                             local_validation_time += local_timer.elapsed();
                             local_timer = Instant::now();
                             if version_to_execute.is_none() {
+                                // if valid {
+                                //     println!("txn {} validation succeeded!", version_to_validate);
+                                // }
                                 // Validation successfully completed or someone already aborted,
                                 // continue to the work loop.
                                 continue;
@@ -374,6 +378,7 @@ where
                             // here.
                             continue;
                         }
+                        // println!("txn {} executed!", txn_to_execute);
                         
                         let retry_num = scheduler.retry_num(txn_to_execute);
                         let mut estimated_writes = HashSet::new();

@@ -116,7 +116,7 @@ pub struct Scheduler<K, T, E> {
     // Stores number of threads that are currently validating. Used in combination with validation
     // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
     // counter would generalize to detect what prefix can be committed.
-    pub num_validating: AtomicUsize,
+    num_validating: AtomicUsize,
     // Shared marker that's set when a thread detects all txns can be committed - so
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
