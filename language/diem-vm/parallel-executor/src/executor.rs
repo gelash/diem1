@@ -4,7 +4,7 @@
 use crate::{
     errors::*,
     outcome_array::OutcomeArray,
-    scheduler::{Scheduler, ReadDescriptor},
+    scheduler::{ReadDescriptor, Scheduler},
     task::{ExecutionStatus, ExecutorTask, ReadWriteSetInferencer, Transaction, TransactionOutput},
 };
 use anyhow::{bail, Result as AResult};
@@ -13,16 +13,16 @@ use num_cpus;
 use rayon::{prelude::*, scope};
 use std::{
     cmp::{max, min},
+    collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
+    hint,
+    iter::FromIterator,
     marker::PhantomData,
     sync::{
-        atomic::{AtomicUsize, AtomicBool, Ordering},
-        Arc, RwLock, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
     },
-    collections::{HashMap, HashSet, VecDeque},
-    iter::FromIterator,
     time::{Duration, Instant},
-    hint,
 };
 
 pub struct MVHashMapView<'a, K, V, T, E> {
@@ -33,22 +33,35 @@ pub struct MVHashMapView<'a, K, V, T, E> {
     reads: Arc<Mutex<Vec<ReadDescriptor<K>>>>,
 }
 
-impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: TransactionOutput, E: Send + Clone> MVHashMapView<'a, K, V, T, E> {
+impl<
+        'a,
+        K: PartialOrd + Send + Clone + Hash + Eq,
+        V: Clone + Send + Sync,
+        T: TransactionOutput,
+        E: Send + Clone,
+    > MVHashMapView<'a, K, V, T, E>
+{
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
         let mut reads = self.reads.lock().unwrap();
         std::mem::take(&mut reads)
     }
-    
+
     pub fn read(&self, key: &K) -> AResult<Option<V>> {
         loop {
             match self.map.read(key, self.version) {
                 Ok((v, version, retry_num)) => {
-                    self.reads.lock().unwrap().push(ReadDescriptor::new(key.clone(), Some((version, retry_num))));
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push(ReadDescriptor::new(key.clone(), Some((version, retry_num))));
                     return Ok(v);
                 }
                 Err(None) => {
-                    self.reads.lock().unwrap().push(ReadDescriptor::new(key.clone(), None));
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push(ReadDescriptor::new(key.clone(), None));
                     return Ok(None);
                 }
                 Err(Some((dep_idx, _retry_num))) => {
@@ -64,7 +77,7 @@ impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: Tr
         }
     }
 
-    // Return a (true, version, retry_num) if the read returns a value, 
+    // Return a (true, version, retry_num) if the read returns a value,
     // or (false, version, retry_num) if read dependency, otherwise return None.
     pub fn read_version_and_retry_num(&self, access_path: &K) -> Option<(usize, usize)> {
         // reads may return Ok((Option<V>, version, retry_num) when there is value and no read dependency
@@ -85,13 +98,15 @@ impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: Tr
         retry_num: usize,
         data: Option<V>,
         estimated_writes: &HashSet<&K>,
-    ) -> Result<(), Error<E>>  {
+    ) -> Result<(), Error<E>> {
         // Write estimated writes to static mvhashmap, and write non-estimated ones to dynamic mvhashmap
         if estimated_writes.contains(k) {
-            self.map.write_to_static(k, version, retry_num, data)
+            self.map
+                .write_to_static(k, version, retry_num, data)
                 .unwrap();
         } else {
-            self.map.write_to_dynamic(k, version, retry_num, data)
+            self.map
+                .write_to_dynamic(k, version, retry_num, data)
                 .unwrap();
         }
         Ok(())
@@ -106,7 +121,9 @@ impl<'a, K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Send + Sync, T: Tr
     ) {
         for (k, _) in actual_writes {
             if !estimated_writes.contains(k) {
-                self.map.set_dirty_to_dynamic(k, version, retry_num).unwrap();
+                self.map
+                    .set_dirty_to_dynamic(k, version, retry_num)
+                    .unwrap();
             } else {
                 self.map.set_dirty_to_static(k, version, retry_num).unwrap();
             }
@@ -190,7 +207,7 @@ where
             MVHashMap::new_from_parallel(path_version_tuples);
         let outcomes = OutcomeArray::new(num_txns);
 
-        let scheduler = Arc::new(Scheduler::new(num_txns));
+        let scheduler = Scheduler::new(num_txns);
 
         let delay_execution_counter = AtomicUsize::new(0);
         let revalidation_counter = AtomicUsize::new(0);
@@ -224,7 +241,6 @@ where
             );
             for _ in 0..(compute_cpus) {
                 s.spawn(|_| {
-                    let scheduler = Arc::clone(&scheduler);
                     // Make a new executor per thread.
                     let task = E::init(task_initial_arguments);
 
@@ -287,7 +303,11 @@ where
                                 state_view.mark_dirty(
                                     version_to_validate,
                                     status_to_validate.retry_num(),
-                                    &infer_result[version_to_validate].keys_written.iter().cloned().collect(),
+                                    &infer_result[version_to_validate]
+                                        .keys_written
+                                        .iter()
+                                        .cloned()
+                                        .collect(),
                                     &status_to_validate.write_set(),
                                 );
                                 local_validation_write_time += write_timer.elapsed();
@@ -298,39 +318,36 @@ where
                                 version_to_execute = Some(version_to_validate);
 
                                 revalidation_counter.fetch_add(1, Ordering::Relaxed);
-                                // println!("txn {} validation failed and aborted!", version_to_validate);
                             }
 
                             last_validator_no_work = scheduler.finish_validation();
                             local_validation_time += local_timer.elapsed();
                             local_timer = Instant::now();
+
                             if version_to_execute.is_none() {
-                                // if valid {
-                                //     println!("txn {} validation succeeded!", version_to_validate);
-                                // }
                                 // Validation successfully completed or someone already aborted,
                                 // continue to the work loop.
                                 continue;
                             }
+                        } else {
+                            version_to_execute = scheduler.next_txn_to_execute();
                         }
 
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
-                            version_to_execute = scheduler.next_txn_to_execute();
-                            if version_to_execute.is_none() {
-                                local_nothing_to_exe_time += local_timer.elapsed();
-                                local_timer = Instant::now();
+                            local_nothing_to_exe_time += local_timer.elapsed();
+                            local_timer = Instant::now();
 
-                                // Give up the resources so other threads can progress (HT).
-                                hint::spin_loop();
+                            // Give up the resources so other threads can progress (HT).
+                            hint::spin_loop();
 
-                                local_check_done_time += local_timer.elapsed();
-                                local_timer = Instant::now();
+                            local_check_done_time += local_timer.elapsed();
+                            local_timer = Instant::now();
 
-                                // Nothing to execute, continue to the work loop.
-                                continue;
-                            }
+                            // Nothing to execute, continue to the work loop.
+                            continue;
                         }
+
                         last_validator_no_work = false;
                         local_get_txn_to_exe_time += local_timer.elapsed();
                         local_timer = Instant::now();
@@ -352,7 +369,9 @@ where
                         // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
                         if txn_accesses.keys_read.iter().any(|k| {
                             match versioned_data_cache.read_from_static(k, txn_to_execute) {
-                                Err(Some((dep_id, _))) => scheduler.add_dependency(txn_to_execute, dep_id),
+                                Err(Some((dep_id, _))) => {
+                                    scheduler.add_dependency(txn_to_execute, dep_id)
+                                }
                                 Ok(_) | Err(None) => false,
                             }
                         }) {
@@ -378,53 +397,69 @@ where
                             // here.
                             continue;
                         }
-                        // println!("txn {} executed!", txn_to_execute);
-                        
+
                         let retry_num = scheduler.retry_num(txn_to_execute);
                         let mut estimated_writes = HashSet::new();
                         for write in txn_accesses.keys_written.iter() {
                             estimated_writes.insert(write);
                         }
 
-                        let commit_result =
-                            match execute_result {
-                                ExecutionStatus::Success(output) => {
-                                    // Commit the side effects to the versioned_data_cache.
-                                    if output.get_writes().into_iter().all(|(k, v)| {
-                                        state_view.write(&k, txn_to_execute, retry_num, Some(v), &estimated_writes).is_ok()
-                                    }) {
-                                        ExecutionStatus::Success(output)
-                                    } else {
-                                        // Failed to write to the versioned data cache as
-                                        // transaction write to a key that wasn't estimated by the
-                                        // inferencer, aborting the entire execution.
-                                        ExecutionStatus::Abort(Error::UnestimatedWrite)
-                                    }
+                        let commit_result = match execute_result {
+                            ExecutionStatus::Success(output) => {
+                                // Commit the side effects to the versioned_data_cache.
+                                if output.get_writes().into_iter().all(|(k, v)| {
+                                    state_view
+                                        .write(
+                                            &k,
+                                            txn_to_execute,
+                                            retry_num,
+                                            Some(v),
+                                            &estimated_writes,
+                                        )
+                                        .is_ok()
+                                }) {
+                                    ExecutionStatus::Success(output)
+                                } else {
+                                    // Failed to write to the versioned data cache as
+                                    // transaction write to a key that wasn't estimated by the
+                                    // inferencer, aborting the entire execution.
+                                    ExecutionStatus::Abort(Error::UnestimatedWrite)
                                 }
-                                ExecutionStatus::SkipRest(output) => {
-                                    // Commit and skip the rest of the transactions.
-                                    if output.get_writes().into_iter().all(|(k, v)| {
-                                        state_view.write(&k, txn_to_execute, retry_num, Some(v), &estimated_writes).is_ok()
-                                    }) {
-                                        scheduler.set_stop_version(txn_to_execute + 1);
-                                        ExecutionStatus::SkipRest(output)
-                                    } else {
-                                        // Failed to write to the versioned data cache as
-                                        // transaction write to a key that wasn't estimated by the
-                                        // inferencer, aborting the entire execution.
-                                        ExecutionStatus::Abort(Error::UnestimatedWrite)
-                                    }
-                                }
-                                ExecutionStatus::Abort(err) => {
-                                    // Abort the execution with user defined error.
+                            }
+                            ExecutionStatus::SkipRest(output) => {
+                                // Commit and skip the rest of the transactions.
+                                if output.get_writes().into_iter().all(|(k, v)| {
+                                    state_view
+                                        .write(
+                                            &k,
+                                            txn_to_execute,
+                                            retry_num,
+                                            Some(v),
+                                            &estimated_writes,
+                                        )
+                                        .is_ok()
+                                }) {
                                     scheduler.set_stop_version(txn_to_execute + 1);
-                                    ExecutionStatus::Abort(Error::UserError(err.clone()))
+                                    ExecutionStatus::SkipRest(output)
+                                } else {
+                                    // Failed to write to the versioned data cache as
+                                    // transaction write to a key that wasn't estimated by the
+                                    // inferencer, aborting the entire execution.
+                                    ExecutionStatus::Abort(Error::UnestimatedWrite)
                                 }
-                            };
+                            }
+                            ExecutionStatus::Abort(err) => {
+                                // Abort the execution with user defined error.
+                                scheduler.set_stop_version(txn_to_execute + 1);
+                                ExecutionStatus::Abort(Error::UserError(err.clone()))
+                            }
+                        };
 
                         for write in txn_accesses.keys_written.iter() {
                             // Unwrap here is fine because all writes here should be in the mvhashmap.
-                            assert!(versioned_data_cache.skip_if_not_set(write, txn_to_execute, retry_num).is_ok());
+                            assert!(versioned_data_cache
+                                .skip_if_not_set(write, txn_to_execute, retry_num)
+                                .is_ok());
                         }
 
                         scheduler.finish_execution(

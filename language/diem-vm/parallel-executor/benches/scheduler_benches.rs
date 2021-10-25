@@ -11,9 +11,9 @@ use proptest::prelude::*;
 
 fn random_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_benches-size-example");
-    group.sample_size(1000); // number of iterations the benchmark will run
+    group.sample_size(500000); // number of iterations the benchmark will run
     group.bench_function("random_benches", |b| {
-        let bencher = Bencher::<[u8; 1], [u8; 1]>::new(30, 2, 1.0, 0.0); // number of txns, number of accounts, percentage of unestimated write, percentage of unestimated read
+        let bencher = Bencher::<[u8; 1], [u8; 1]>::new(1000, 2, 1.0, 0.0); // number of txns, number of accounts, percentage of unestimated write, percentage of unestimated read
         bencher.bench(&any::<[u8; 1]>(), b)
     });
 }

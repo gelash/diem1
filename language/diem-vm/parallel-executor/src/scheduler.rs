@@ -1,23 +1,20 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use arc_swap::ArcSwap;
-use crossbeam::utils::CachePadded;
-use crossbeam_queue::SegQueue;
-use mvhashmap::Version;
-use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, RwLock, Mutex,
-};
 use crate::{
     errors::{Error, Result},
     task::{ExecutionStatus, Transaction, TransactionOutput},
 };
+use arc_swap::ArcSwap;
+use crossbeam::utils::CachePadded;
+use crossbeam_queue::SegQueue;
+use mvhashmap::Version;
+use std::sync::atomic::fence;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
-// #[repr(usize)]
-// enum ExecutionStatus {
-//     Executed = 1,
-//     NotExecuted = 0,
-// }
+const MASK: u64 = ((1 as u64) << 32) - 1;
 
 #[derive(Clone)]
 pub struct ReadDescriptor<K> {
@@ -45,24 +42,47 @@ impl<K> ReadDescriptor<K> {
     }
 }
 
+// Transactions input/output set from the last execution (for all actual reads and writes),
+// plus a bit to (test-and-set) synchronize among failed validators (so only one can abort).
+struct ExecutedStatus<K, T, E> {
+    input: Vec<ReadDescriptor<K>>,
+
+    output: ExecutionStatus<T, Error<E>>,
+
+    abort_bit: AtomicUsize,
+}
+
+impl<K, T: TransactionOutput, E: Send + Clone> ExecutedStatus<K, T, E> {
+    pub fn input(&self) -> &Vec<ReadDescriptor<K>> {
+        &self.input
+    }
+
+    pub fn output(&self) -> &ExecutionStatus<T, Error<E>> {
+        &self.output
+    }
+
+    // TODO: could do by CAS on retry_num.
+    pub fn abort(&self) -> bool {
+        self.abort_bit.swap(1, Ordering::Relaxed) == 0
+    }
+}
+
 // Transaction status, updated using RCU. Starts with retry_num = 0 and input_output = None
 // that signifies NOT_EXECUTED status. When the transaction is first executed, new STMStatus
-// w. retry_num = 1 and the input/output of the corresponding execution will be stored.
+// w. retry_num = 1 and the corresponding ExecutedStatus will be stored.
 // If the transaction is later aborted, the status will become (1, None).
 pub struct STMStatus<K, T, E> {
     retry_num: usize, // how many times the corresponding txn has been re-tried.
 
-    // Transactions input/output set from the last execution (for all actual reads and writes).
-    // For reads we just store (version, retry_num) pairs. TODO: Version alias for usize.
     // If None, then the corresponding retry_num execution hasn't yet completed.
-    input_output: Option<(Vec<ReadDescriptor<K>>, ExecutionStatus<T, Error<E>>)>,
+    executed: Option<ExecutedStatus<K, T, E>>,
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
     pub fn new_before_execution(retry_num: usize) -> Self {
         Self {
             retry_num,
-            input_output: None,
+            executed: None,
         }
     }
 
@@ -73,12 +93,16 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
     ) -> Self {
         Self {
             retry_num,
-            input_output: Some((input, output)),
+            executed: Some(ExecutedStatus::<K, T, E> {
+                input,
+                output,
+                abort_bit: AtomicUsize::new(0),
+            }),
         }
     }
 
     pub fn executed(&self) -> bool {
-        self.input_output.is_some()
+        self.executed.is_some()
     }
 
     pub fn retry_num(&self) -> usize {
@@ -87,12 +111,17 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner Vec.
     pub fn read_set(&self) -> &Vec<ReadDescriptor<K>> {
-        &self.input_output.as_ref().unwrap().0
+        &self.executed.as_ref().unwrap().input()
     }
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
-    pub fn write_set(&self) -> Vec<(<<T as TransactionOutput>::T as Transaction>::Key, <<T as TransactionOutput>::T as Transaction>::Value)> {
-        let output = &self.input_output.as_ref().unwrap().1;
+    pub fn write_set(
+        &self,
+    ) -> Vec<(
+        <<T as TransactionOutput>::T as Transaction>::Key,
+        <<T as TransactionOutput>::T as Transaction>::Value,
+    )> {
+        let output = &self.executed.as_ref().unwrap().output();
         let t = match output {
             ExecutionStatus::Success(t) => t,
             ExecutionStatus::SkipRest(t) => t,
@@ -102,7 +131,11 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
     }
 
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
-        self.input_output.as_ref().unwrap().1.clone()
+        self.executed.as_ref().unwrap().output().clone()
+    }
+
+    pub fn abort(&self) -> bool {
+        self.executed.as_ref().unwrap().abort()
     }
 }
 
@@ -128,6 +161,7 @@ pub struct Scheduler<K, T, E> {
     txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
     txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
     txn_status: Vec<CachePadded<ArcSwap<STMStatus<K, T, E>>>>, // version -> execution status.
+    retry_seqcst: Vec<CachePadded<AtomicUsize>>, // version -> retry_num.
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
@@ -147,28 +181,36 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                     CachePadded::new(ArcSwap::from_pointee(STMStatus::new_before_execution(0)))
                 })
                 .collect(),
+            retry_seqcst: (0..num_txns)
+                .map(|_| CachePadded::new(AtomicUsize::new(0)))
+                .collect(),
         }
     }
 
-    fn decrease_validation_marker(&self, target_version: usize) {
+    pub fn decrease_validation_marker(&self, target_version: usize) {
         loop {
             let val_marker = self.validation_marker.load(Ordering::SeqCst);
 
             let val_version = val_marker >> 32;
-            if val_version as usize <= target_version {
-                // Already below the desired index, no need to decrease (idx will be validated).
+
+            if (val_version as usize) < target_version {
+                // Already below the desired index (read w. SeqCst), so no need to
+                // decrease (target_version will be validated, and retry visible).
+                // Note: can't abort when it's equal - a CAS in next_txn_to_validate
+                // can be covering w. the same val_marker and increase back. '<' is
+                // fine because a covering CAS can't exist: read of target_version
+                // w. correct gen counter must happen later, when retry is visible.
                 return;
             }
 
-            let new_num_decrease = (val_marker & (1 << 32 - 1)) + 1;
-            // TODO: assert no overflow.
-            let new_marker = ((target_version << 32) as u64) | new_num_decrease;
+            let new_num_decrease = (val_marker & MASK) + 1;
+            let new_marker = (((target_version as u64) << 32) as u64) | new_num_decrease;
 
-            if let Ok(_) = self.validation_marker.compare_exchange(
+            if let Ok(_) = self.validation_marker.compare_exchange_weak(
                 val_marker,
                 new_marker,
                 Ordering::SeqCst, // Make sure my decrease is sequentially consistent.
-                Ordering::SeqCst, // Make sure any decrease is ordered before.
+                Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
             ) {
                 // Successfully updated.
                 return;
@@ -177,17 +219,29 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, E>>) -> bool {
-        let stored_ptr = self.txn_status[version].compare_and_swap(
-            cur_status,
-            Arc::new(STMStatus::new_before_execution(cur_status.retry_num() + 1)),
-        );
+        let new_retry = self.retry_num(version) + 1;
 
-        if !Arc::ptr_eq(&stored_ptr, cur_status) {
-            // The corresponding re-execution was already aborted, nothing to do.
+        if !cur_status.abort() {
+            let real_status = self.txn_status[version].load_full();
+            println!(
+                "Did not win abort {}, {}, {}, read again status retry {}",
+                version,
+                cur_status.retry_num(),
+                new_retry - 1,
+                real_status.retry_num(),
+                // thread::current().id(),
+            );
             return false;
         }
 
         // Successfully aborted.
+        // let new_retry = self.retry_num(version) + 1;
+        if (new_retry & 1) == 1 {
+            panic!();
+        }
+
+        self.retry_seqcst[version].store(new_retry, Ordering::SeqCst);
+        // Safe to decrease here because the caller marks dirty, then re-executes.
         self.decrease_validation_marker(version);
         true
     }
@@ -195,30 +249,41 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Return the next txn version & status for the thread to validate.
     pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
         loop {
-            let val_marker = self.validation_marker.load(Ordering::Acquire); // status read below.
+            // Read val_marker, seq cst ordered for status reads (here below).
+            let val_marker = self.validation_marker.load(Ordering::SeqCst);
 
             let next_to_val = (val_marker >> 32) as usize;
             if next_to_val >= self.num_txn_to_execute() {
                 return None;
             }
+
             let next_status = self.txn_status[next_to_val].load_full();
-            if !next_status.executed() {
+            let retry_bound = self.retry_num(next_to_val);
+            if (retry_bound & 1) == 0 {
                 // No more transactions or next txn not yet (re-)executed to validate.
                 return None;
             }
 
-            let num_decrease = val_marker & (1 << 32 - 1);
+            if next_status.retry_num() > retry_bound {
+                panic!();
+            }
+
+            if next_status.retry_num() != retry_bound {
+                return None;
+            }
+
+            let num_decrease = val_marker & MASK;
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
 
             // Mark that thread is validating next_to_val, else early abort possible.
             self.num_validating.fetch_add(1, Ordering::SeqCst);
 
             // CAS to win the competition to actually validate next_to_val.
-            if let Ok(_) = self.validation_marker.compare_exchange(
+            if let Ok(_) = self.validation_marker.compare_exchange_weak(
                 val_marker,
                 new_marker,
-                Ordering::SeqCst, // Keep status stores above.
-                Ordering::Acquire,
+                Ordering::SeqCst,  // Keep status stores above.
+                Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
             ) {
                 // CAS successful, return index & status.
                 return Some((next_to_val, next_status));
@@ -259,8 +324,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
         // txn_dependency is initialized for all versions, so unwrap() is safe.
         let mut stored_deps = self.txn_dependency[dep_version].lock().unwrap();
-        if !self.txn_status[dep_version].load().executed()
-        {
+        if !self.txn_status[dep_version].load_full().executed() {
             stored_deps.push(version);
             return true;
         }
@@ -268,7 +332,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn retry_num(&self, version: usize) -> usize {
-        self.txn_status[version].load().retry_num()
+        self.retry_seqcst[version].load(Ordering::SeqCst)
     }
 
     pub fn output(&self, version: usize) -> ExecutionStatus<T, Error<E>> {
@@ -283,9 +347,30 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
     ) {
+        let val_marker = self.validation_marker.load(Ordering::SeqCst);
+        let next_to_val = (val_marker >> 32) as usize;
+        if next_to_val > version {
+            println!(
+                "val {}, exec ver {}, retry {}",
+                next_to_val,
+                version,
+                retry_num,
+                // thread::current().id(),
+            );
+            // panic!();
+        }
+
+        if (retry_num & 1) == 1 {
+            panic!();
+        }
+
+        self.retry_seqcst[version].store(retry_num + 1, Ordering::SeqCst);
+        // fence(Ordering::SeqCst);
         // Store is safe because of an invariant that there is at most one execution at a time.
         self.txn_status[version].store(Arc::new(STMStatus::new_after_execution(
-            retry_num, input, output,
+            retry_num + 1,
+            input,
+            output,
         )));
 
         // we want to make things fast inside the lock, so use replace instead of clone
@@ -313,11 +398,6 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             .fetch_min(stop_version, Ordering::Relaxed);
     }
 
-    // // Adding version to the ready queue.
-    // pub fn add_transaction(&self, version: Version) {
-    //     self.txn_buffer.push(version)
-    // }
-
     // Get the last txn version/id
     pub fn num_txn_to_execute(&self) -> Version {
         self.stop_at_version.load(Ordering::Relaxed)
@@ -341,7 +421,6 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
-            println!("val_version {} num_txns {}", val_version, num_txns);
             // self.done_marker.store(1, Ordering::SeqCst);
             self.done_marker.store(1, Ordering::Release);
         }
