@@ -50,11 +50,11 @@ impl<
     pub fn read(&self, key: &K) -> AResult<Option<V>> {
         loop {
             match self.map.read(key, self.version) {
-                Ok((v, version, retry_num)) => {
+                Ok((v, version, exec_id)) => {
                     self.reads
                         .lock()
                         .unwrap()
-                        .push(ReadDescriptor::new(key.clone(), Some((version, retry_num))));
+                        .push(ReadDescriptor::new(key.clone(), Some((version, exec_id))));
                     return Ok(v);
                 }
                 Err(None) => {
@@ -64,7 +64,7 @@ impl<
                         .push(ReadDescriptor::new(key.clone(), None));
                     return Ok(None);
                 }
-                Err(Some((dep_idx, _retry_num))) => {
+                Err(Some((dep_idx, _exec_id))) => {
                     // Don't start execution transaction `self.version` until `dep_idx` is computed.
                     if self.scheduler.add_dependency(self.version, dep_idx) {
                         // dep_idx is already executed, push `self.version` to ready queue.
@@ -77,15 +77,15 @@ impl<
         }
     }
 
-    // Return a (true, version, retry_num) if the read returns a value,
-    // or (false, version, retry_num) if read dependency, otherwise return None.
-    pub fn read_version_and_retry_num(&self, access_path: &K) -> Option<(usize, usize)> {
-        // reads may return Ok((Option<V>, version, retry_num) when there is value and no read dependency
-        // or Err(Some<version, retry_num>) when there is read dependency
+    // Return a (true, version, exec_id) if the read returns a value,
+    // or (false, version, exec_id) if read dependency, otherwise return None.
+    pub fn read_version_and_exec_id(&self, access_path: &K) -> Option<(usize, usize)> {
+        // reads may return Ok((Option<V>, version, exec_id) when there is value and no read dependency
+        // or Err(Some<version, exec_id>) when there is read dependency
         // or Err(None) when there is no value and no read dependency
         match self.map.read(access_path, self.version) {
-            Ok((_, version, retry_num)) => Some((version, retry_num)),
-            Err(Some((version, retry_num))) => Some((version, retry_num)),
+            Ok((_, version, exec_id)) => Some((version, exec_id)),
+            Err(Some((version, exec_id))) => Some((version, exec_id)),
             Err(None) => None,
         }
     }
@@ -95,18 +95,16 @@ impl<
         &self,
         k: &K,
         version: Version,
-        retry_num: usize,
+        exec_id: usize,
         data: Option<V>,
         estimated_writes: &HashSet<&K>,
     ) -> Result<(), Error<E>> {
         // Write estimated writes to static mvhashmap, and write non-estimated ones to dynamic mvhashmap
         if estimated_writes.contains(k) {
-            self.map
-                .write_to_static(k, version, retry_num, data)
-                .unwrap();
+            self.map.write_to_static(k, version, exec_id, data).unwrap();
         } else {
             self.map
-                .write_to_dynamic(k, version, retry_num, data)
+                .write_to_dynamic(k, version, exec_id, data)
                 .unwrap();
         }
         Ok(())
@@ -115,17 +113,15 @@ impl<
     pub fn mark_dirty(
         &self,
         version: usize,
-        retry_num: usize,
+        exec_id: usize,
         estimated_writes: &Vec<K>,
         actual_writes: &Vec<(K, V)>,
     ) {
         for (k, _) in actual_writes {
             if !estimated_writes.contains(k) {
-                self.map
-                    .set_dirty_to_dynamic(k, version, retry_num)
-                    .unwrap();
+                self.map.set_dirty_to_dynamic(k, version, exec_id).unwrap();
             } else {
-                self.map.set_dirty_to_static(k, version, retry_num).unwrap();
+                self.map.set_dirty_to_static(k, version, exec_id).unwrap();
             }
         }
     }
@@ -291,7 +287,7 @@ where
                             // validating, all prior txn's must have been executed already).
                             let valid = versioned_data_cache.dynamic_empty()
                                 || status_to_validate.read_set().iter().all(|r| {
-                                    r.validate(state_view.read_version_and_retry_num(r.path()))
+                                    r.validate(state_view.read_version_and_exec_id(r.path()))
                                 });
                             local_validation_read_time += read_timer.elapsed();
 
@@ -302,7 +298,7 @@ where
                                 let write_timer = Instant::now();
                                 state_view.mark_dirty(
                                     version_to_validate,
-                                    status_to_validate.retry_num(),
+                                    status_to_validate.exec_id(),
                                     &infer_result[version_to_validate]
                                         .keys_written
                                         .iter()
@@ -398,7 +394,7 @@ where
                             continue;
                         }
 
-                        let retry_num = scheduler.retry_num(txn_to_execute);
+                        let exec_id = scheduler.exec_id(txn_to_execute);
                         let mut estimated_writes = HashSet::new();
                         for write in txn_accesses.keys_written.iter() {
                             estimated_writes.insert(write);
@@ -412,7 +408,7 @@ where
                                         .write(
                                             &k,
                                             txn_to_execute,
-                                            retry_num,
+                                            exec_id,
                                             Some(v),
                                             &estimated_writes,
                                         )
@@ -433,7 +429,7 @@ where
                                         .write(
                                             &k,
                                             txn_to_execute,
-                                            retry_num,
+                                            exec_id,
                                             Some(v),
                                             &estimated_writes,
                                         )
@@ -458,13 +454,13 @@ where
                         for write in txn_accesses.keys_written.iter() {
                             // Unwrap here is fine because all writes here should be in the mvhashmap.
                             assert!(versioned_data_cache
-                                .skip_if_not_set(write, txn_to_execute, retry_num)
+                                .skip_if_not_set(write, txn_to_execute, exec_id)
                                 .is_ok());
                         }
 
                         scheduler.finish_execution(
                             txn_to_execute,
-                            retry_num,
+                            exec_id,
                             state_view.drain_reads(),
                             commit_result,
                         );

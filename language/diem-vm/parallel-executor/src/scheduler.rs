@@ -4,11 +4,10 @@ use crate::{
     errors::{Error, Result},
     task::{ExecutionStatus, Transaction, TransactionOutput},
 };
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
 use mvhashmap::Version;
-use std::sync::atomic::fence;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -20,16 +19,16 @@ const MASK: u64 = ((1 as u64) << 32) - 1;
 pub struct ReadDescriptor<K> {
     access_path: K,
 
-    // Is set to (version, retry_num) if the read was from shared MV data-structure
+    // Is set to (version, exec_id) if the read was from shared MV data-structure
     // (written by a previous txn), None if read from storage.
-    version_and_retry_num: Option<(usize, usize)>, // TODO: Version alias for usize.
+    version_and_exec_id: Option<(usize, usize)>, // TODO: Version alias for usize.
 }
 
 impl<K> ReadDescriptor<K> {
-    pub fn new(access_path: K, version_and_retry_num: Option<(usize, usize)>) -> Self {
+    pub fn new(access_path: K, version_and_exec_id: Option<(usize, usize)>) -> Self {
         Self {
             access_path,
-            version_and_retry_num,
+            version_and_exec_id,
         }
     }
 
@@ -37,81 +36,32 @@ impl<K> ReadDescriptor<K> {
         &self.access_path
     }
 
-    pub fn validate(&self, new_version_and_retry_num: Option<(usize, usize)>) -> bool {
-        self.version_and_retry_num == new_version_and_retry_num
+    pub fn validate(&self, new_version_and_exec_id: Option<(usize, usize)>) -> bool {
+        self.version_and_exec_id == new_version_and_exec_id
     }
 }
 
-// Transactions input/output set from the last execution (for all actual reads and writes),
-// plus a bit to (test-and-set) synchronize among failed validators (so only one can abort).
-struct ExecutedStatus<K, T, E> {
-    input: Vec<ReadDescriptor<K>>,
-
-    output: ExecutionStatus<T, Error<E>>,
-
-    abort_bit: AtomicUsize,
-}
-
-impl<K, T: TransactionOutput, E: Send + Clone> ExecutedStatus<K, T, E> {
-    pub fn input(&self) -> &Vec<ReadDescriptor<K>> {
-        &self.input
-    }
-
-    pub fn output(&self) -> &ExecutionStatus<T, Error<E>> {
-        &self.output
-    }
-
-    // TODO: could do by CAS on retry_num.
-    pub fn abort(&self) -> bool {
-        self.abort_bit.swap(1, Ordering::Relaxed) == 0
-    }
-}
-
-// Transaction status, updated using RCU. Starts with retry_num = 0 and input_output = None
-// that signifies NOT_EXECUTED status. When the transaction is first executed, new STMStatus
-// w. retry_num = 1 and the corresponding ExecutedStatus will be stored.
-// If the transaction is later aborted, the status will become (1, None).
+// Transaction status. When the transaction is first executed, new STMStatus
+// w. exec_id = 1 and the corresponding input/ouput is stored.
 pub struct STMStatus<K, T, E> {
-    retry_num: usize, // how many times the corresponding txn has been re-tried.
+    // Unique identifier for each (re-)execution. Guaranteed to be add, with first execution
+    // having exec_id = 1, second re-execution having exec_id = 3, etc.
+    exec_id: usize,
 
-    // If None, then the corresponding retry_num execution hasn't yet completed.
-    executed: Option<ExecutedStatus<K, T, E>>,
+    // Transactions input/output set from the last execution (for all actual reads and writes),
+    // plus a bit to (test-and-set) synchronize among failed validators (so only one can abort).
+    input: Vec<ReadDescriptor<K>>,
+    output: ExecutionStatus<T, Error<E>>,
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
-    pub fn new_before_execution(retry_num: usize) -> Self {
-        Self {
-            retry_num,
-            executed: None,
-        }
-    }
-
-    pub fn new_after_execution(
-        retry_num: usize,
-        input: Vec<ReadDescriptor<K>>,
-        output: ExecutionStatus<T, Error<E>>,
-    ) -> Self {
-        Self {
-            retry_num,
-            executed: Some(ExecutedStatus::<K, T, E> {
-                input,
-                output,
-                abort_bit: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    pub fn executed(&self) -> bool {
-        self.executed.is_some()
-    }
-
-    pub fn retry_num(&self) -> usize {
-        self.retry_num
+    pub fn exec_id(&self) -> usize {
+        self.exec_id
     }
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner Vec.
     pub fn read_set(&self) -> &Vec<ReadDescriptor<K>> {
-        &self.executed.as_ref().unwrap().input()
+        &self.input
     }
 
     // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
@@ -121,7 +71,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
         <<T as TransactionOutput>::T as Transaction>::Key,
         <<T as TransactionOutput>::T as Transaction>::Value,
     )> {
-        let output = &self.executed.as_ref().unwrap().output();
+        let output = &self.output;
         let t = match output {
             ExecutionStatus::Success(t) => t,
             ExecutionStatus::SkipRest(t) => t,
@@ -131,11 +81,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
     }
 
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
-        self.executed.as_ref().unwrap().output().clone()
-    }
-
-    pub fn abort(&self) -> bool {
-        self.executed.as_ref().unwrap().abort()
+        self.output.clone()
     }
 }
 
@@ -160,8 +106,11 @@ pub struct Scheduler<K, T, E> {
 
     txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
     txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
-    txn_status: Vec<CachePadded<ArcSwap<STMStatus<K, T, E>>>>, // version -> execution status.
-    retry_seqcst: Vec<CachePadded<AtomicUsize>>, // version -> retry_num.
+    txn_status: Vec<CachePadded<ArcSwapOption<STMStatus<K, T, E>>>>, // version -> execution status.
+
+    // ArcSwap load isn't sequentially consistent, so we separately store latest exec id and
+    // manually synchronize the status with it.
+    exec_id_seqcst: Vec<CachePadded<AtomicUsize>>,
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
@@ -177,11 +126,9 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 .map(|_| Arc::new(Mutex::new(Vec::new())))
                 .collect(),
             txn_status: (0..num_txns)
-                .map(|_| {
-                    CachePadded::new(ArcSwap::from_pointee(STMStatus::new_before_execution(0)))
-                })
+                .map(|_| CachePadded::new(ArcSwapOption::empty()))
                 .collect(),
-            retry_seqcst: (0..num_txns)
+            exec_id_seqcst: (0..num_txns)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),
         }
@@ -195,11 +142,10 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
             if (val_version as usize) < target_version {
                 // Already below the desired index (read w. SeqCst), so no need to
-                // decrease (target_version will be validated, and retry visible).
+                // decrease (target_version will be validated, and exec_id visible).
                 // Note: can't abort when it's equal - a CAS in next_txn_to_validate
                 // can be covering w. the same val_marker and increase back. '<' is
-                // fine because a covering CAS can't exist: read of target_version
-                // w. correct gen counter must happen later, when retry is visible.
+                // fine because a covering CAS can't already exist: must read later.
                 return;
             }
 
@@ -219,31 +165,19 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, E>>) -> bool {
-        let new_retry = self.retry_num(version) + 1;
+        if let Ok(_) = self.exec_id_seqcst[version].compare_exchange(
+            cur_status.exec_id(),
+            cur_status.exec_id() + 1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            // Safe to decrease here because the caller marks dirty, then re-executes.
+            self.decrease_validation_marker(version);
 
-        if !cur_status.abort() {
-            let real_status = self.txn_status[version].load_full();
-            println!(
-                "Did not win abort {}, {}, {}, read again status retry {}",
-                version,
-                cur_status.retry_num(),
-                new_retry - 1,
-                real_status.retry_num(),
-                // thread::current().id(),
-            );
-            return false;
+            // Successfully aborted.
+            return true;
         }
-
-        // Successfully aborted.
-        // let new_retry = self.retry_num(version) + 1;
-        if (new_retry & 1) == 1 {
-            panic!();
-        }
-
-        self.retry_seqcst[version].store(new_retry, Ordering::SeqCst);
-        // Safe to decrease here because the caller marks dirty, then re-executes.
-        self.decrease_validation_marker(version);
-        true
+        false
     }
 
     // Return the next txn version & status for the thread to validate.
@@ -257,18 +191,21 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 return None;
             }
 
-            let next_status = self.txn_status[next_to_val].load_full();
-            let retry_bound = self.retry_num(next_to_val);
-            if (retry_bound & 1) == 0 {
-                // No more transactions or next txn not yet (re-)executed to validate.
+            // Read a seq consistent exec_id watermark and only validate a status with
+            // a matching exec_id.
+            let exec_id_watermark = self.exec_id(next_to_val);
+            if (exec_id_watermark & 1) == 0 {
+                // Even watermark means awating (re-)execution, not ready to validate.
                 return None;
             }
-
-            if next_status.retry_num() > retry_bound {
-                panic!();
+            let status = self.txn_status[next_to_val].load_full();
+            if !status.is_some() {
+                // Status not even visible, not ready to validate.
+                return None;
             }
-
-            if next_status.retry_num() != retry_bound {
+            let next_status = status.unwrap();
+            if next_status.exec_id() != exec_id_watermark {
+                // exec_id not matching watermark.
                 return None;
             }
 
@@ -286,7 +223,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
             ) {
                 // CAS successful, return index & status.
-                return Some((next_to_val, next_status));
+                return Some((next_to_val, next_status.clone()));
             } else {
                 // CAS unsuccessful - not validating next_to_val (will try different index).
                 if self.finish_validation() {
@@ -324,54 +261,37 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
         // txn_dependency is initialized for all versions, so unwrap() is safe.
         let mut stored_deps = self.txn_dependency[dep_version].lock().unwrap();
-        if !self.txn_status[dep_version].load_full().executed() {
+        if self.exec_id(dep_version) & 1 == 0 {
             stored_deps.push(version);
             return true;
         }
         false
     }
 
-    pub fn retry_num(&self, version: usize) -> usize {
-        self.retry_seqcst[version].load(Ordering::SeqCst)
+    pub fn exec_id(&self, version: usize) -> usize {
+        self.exec_id_seqcst[version].load(Ordering::SeqCst)
     }
 
     pub fn output(&self, version: usize) -> ExecutionStatus<T, Error<E>> {
-        self.txn_status[version].load().output()
+        // Executed after scheduler done to grab outputs, fine to load.
+        self.txn_status[version].load().as_ref().unwrap().output()
     }
 
     // After txn is executed, add its dependencies to the shared buffer for execution.
     pub fn finish_execution(
         &self,
         version: usize,
-        retry_num: usize,
+        exec_id: usize,
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
     ) {
-        let val_marker = self.validation_marker.load(Ordering::SeqCst);
-        let next_to_val = (val_marker >> 32) as usize;
-        if next_to_val > version {
-            println!(
-                "val {}, exec ver {}, retry {}",
-                next_to_val,
-                version,
-                retry_num,
-                // thread::current().id(),
-            );
-            // panic!();
-        }
-
-        if (retry_num & 1) == 1 {
-            panic!();
-        }
-
-        self.retry_seqcst[version].store(retry_num + 1, Ordering::SeqCst);
-        // fence(Ordering::SeqCst);
-        // Store is safe because of an invariant that there is at most one execution at a time.
-        self.txn_status[version].store(Arc::new(STMStatus::new_after_execution(
-            retry_num + 1,
+        // Stores are safe because there is at most one execution at a time.
+        self.txn_status[version].store(Some(Arc::new(STMStatus {
+            exec_id: exec_id + 1,
             input,
             output,
-        )));
+        })));
+        self.exec_id_seqcst[version].store(exec_id + 1, Ordering::SeqCst);
 
         // we want to make things fast inside the lock, so use replace instead of clone
         let mut version_deps: Vec<usize> = {
@@ -421,14 +341,12 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         // Re-read and make sure it hasn't changed. If so, everything can be committed
         // and set the done flag.
         if val_marker == self.validation_marker.load(Ordering::SeqCst) {
-            // self.done_marker.store(1, Ordering::SeqCst);
             self.done_marker.store(1, Ordering::Release);
         }
     }
 
     // Checks whether the done marker is set. The marker can only be set by 'check_done'.
     pub fn done(&self) -> bool {
-        // self.done_marker.load(Ordering::SeqCst) == 1
         self.done_marker.load(Ordering::Acquire) == 1
     }
 }
