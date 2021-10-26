@@ -13,14 +13,13 @@ use num_cpus;
 use rayon::{prelude::*, scope};
 use std::{
     cmp::{max, min},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashSet,
     hash::Hash,
     hint,
-    iter::FromIterator,
     marker::PhantomData,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -29,7 +28,7 @@ pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
     version: Version,
     scheduler: &'a Scheduler<K, T, E>,
-    has_unexpected_read: AtomicBool,
+    read_dependency: AtomicBool,
     reads: Arc<Mutex<Vec<ReadDescriptor<K>>>>,
 }
 
@@ -69,7 +68,7 @@ impl<
                     if self.scheduler.add_dependency(self.version, dep_idx) {
                         // dep_idx is already executed, push `self.version` to ready queue.
                         // self.scheduler.add_transaction(self.version);
-                        self.has_unexpected_read.store(true, Ordering::Relaxed);
+                        self.read_dependency.store(true, Ordering::Relaxed);
                         bail!("Read dependency is not computed, retry later")
                     }
                 }
@@ -130,8 +129,8 @@ impl<
         self.version
     }
 
-    pub fn has_unexpected_read(&self) -> bool {
-        self.has_unexpected_read.load(Ordering::Relaxed)
+    pub fn read_dependency(&self) -> bool {
+        self.read_dependency.load(Ordering::Relaxed)
     }
 }
 
@@ -277,7 +276,7 @@ where
                                 map: &versioned_data_cache,
                                 version: version_to_validate,
                                 scheduler: &scheduler,
-                                has_unexpected_read: AtomicBool::new(false),
+                                read_dependency: AtomicBool::new(false),
                                 reads: Arc::new(Mutex::new(Vec::new())),
                             };
 
@@ -356,7 +355,7 @@ where
                             map: &versioned_data_cache,
                             version: txn_to_execute,
                             scheduler: &scheduler,
-                            has_unexpected_read: AtomicBool::new(false),
+                            read_dependency: AtomicBool::new(false),
                             reads: Arc::new(Mutex::new(Vec::new())),
                         };
 
@@ -387,7 +386,7 @@ where
                         local_execution_time += local_timer.elapsed();
                         local_timer = Instant::now();
 
-                        if state_view.has_unexpected_read() {
+                        if state_view.read_dependency() {
                             // We've already added this transaction back to the scheduler in the
                             // MVHashmapView where this bit is set, thus it is safe to continue
                             // here.

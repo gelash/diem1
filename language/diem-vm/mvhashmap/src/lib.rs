@@ -1,7 +1,6 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use once_cell::sync::OnceCell;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::{
@@ -9,7 +8,7 @@ use std::{
     collections::{btree_map::BTreeMap, HashMap},
     fmt::Debug,
     hash::Hash,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
 };
 
@@ -66,10 +65,6 @@ impl<V> WriteCell<V> {
         }
     }
 
-    pub fn is_assigned(&self) -> bool {
-        self.flag.load(Ordering::SeqCst) == FLAG_DONE
-    }
-
     pub fn write(&self, v: Option<V>, retry_num: usize) {
         self.data.store(Arc::new(v));
         self.retry_num.store(retry_num, Ordering::SeqCst);
@@ -77,13 +72,9 @@ impl<V> WriteCell<V> {
     }
 
     pub fn skip(&self, retry_num: usize) {
-        self.flag.store(FLAG_SKIP, Ordering::SeqCst);
         self.retry_num.store(retry_num, Ordering::SeqCst);
+        self.flag.store(FLAG_SKIP, Ordering::SeqCst);
     }
-
-    // pub fn get(&self) -> Option<&Option<V>> {
-    //     self.0.get()
-    // }
 }
 
 pub struct StaticMVHashMap<K, V> {
@@ -100,12 +91,8 @@ pub struct MVHashMap<K, V> {
     d_mvhashmap: DynamicMVHashMap<K, V>,
 }
 
-impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send>
-    MVHashMap<K, V>
-{
-    pub fn new_from_parallel(
-        possible_writes: Vec<(K, Version)>,
-    ) -> (MVHashMap<K, V>, usize) {
+impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap<K, V> {
+    pub fn new_from_parallel(possible_writes: Vec<(K, Version)>) -> (MVHashMap<K, V>, usize) {
         let (s_mvhashmap, max_dependency_length) =
             StaticMVHashMap::new_from_parallel(possible_writes);
         let d_mvhashmap = DynamicMVHashMap::new();
@@ -223,7 +210,12 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send>
         self.s_mvhashmap.skip(key, version, retry_num)
     }
 
-    pub fn skip_if_not_set(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+    pub fn skip_if_not_set(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), Error> {
         self.s_mvhashmap.skip_if_not_set(key, version, retry_num)
     }
 
@@ -270,7 +262,13 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 
     /// Write to `key` at `version`.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn write(&self, key: &K, version: Version, retry_num: usize, data: Option<V>) -> Result<(), Error> {
+    pub fn write(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+        data: Option<V>,
+    ) -> Result<(), Error> {
         // By construction there will only be a single writer, before the
         // write there will be no readers on the variable.
         // So it is safe to go ahead and write without any further check.
@@ -284,7 +282,12 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 
     /// Skips writing to `key` at `version` if that entry hasn't been assigned.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn skip_if_not_set(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+    pub fn skip_if_not_set(
+        &self,
+        key: &K,
+        version: Version,
+        retry_num: usize,
+    ) -> Result<(), Error> {
         // We only write or skip once per entry
         // So it is safe to go ahead and just do it.
         let entry = self.get_entry(key, version)?;
@@ -312,7 +315,8 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         let entry = self.get_entry(key, version)?;
 
         entry.flag.store(FLAG_DIRTY, Ordering::SeqCst);
-        entry.retry_num.store(retry_num, Ordering::SeqCst);
+        // TODO: maybe assert retry number is the same.
+        // entry.retry_num.store(retry_num, Ordering::SeqCst);
         Ok(())
     }
 
@@ -320,33 +324,35 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
     /// Returns Ok(val) if such key is already assigned by previous transactions.
     /// Returns Err(None) if `version` is smaller than the write of all previous versions.
     /// Returns Err(Some(version)) if such key is dependent on the `version`-th transaction.
-    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read(
+        &self,
+        key: &K,
+        version: Version,
+    ) -> Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         let tree = self.data.get(key).ok_or(None)?;
 
         let mut iter = tree.range(0..version);
 
         while let Some((entry_key, entry_val)) = iter.next_back() {
-            if *entry_key < version {
-                let flag = entry_val.flag.load(Ordering::SeqCst);
-                let retry = entry_val.retry_num.load(Ordering::SeqCst);
-                
-                // Entry not yet computed, return the version that blocked this query.
-                if flag == FLAG_UNASSIGNED || flag == FLAG_DIRTY {
-                    return Err(Some((*entry_key, retry)));
-                }
+            let flag = entry_val.flag.load(Ordering::SeqCst);
+            let retry = entry_val.retry_num.load(Ordering::SeqCst);
 
-                // Entry is skipped, go to previous version.
-                if flag == FLAG_SKIP {
-                    continue;
-                }
-
-                // The entry is populated so return its contents
-                if flag == FLAG_DONE {
-                    return Ok(((**entry_val.data.load()).clone(), *entry_key, retry));
-                }
-
-                unreachable!();
+            // Entry not yet computed, return the version that blocked this query.
+            if flag == FLAG_UNASSIGNED || flag == FLAG_DIRTY {
+                return Err(Some((*entry_key, retry)));
             }
+
+            // Entry is skipped, go to previous version.
+            if flag == FLAG_SKIP {
+                continue;
+            }
+
+            // The entry is populated so return its contents
+            if flag == FLAG_DONE {
+                return Ok(((**entry_val.data.load()).clone(), *entry_key, retry));
+            }
+
+            unreachable!();
         }
 
         Err(None)
@@ -414,7 +420,6 @@ where
     }
 }
 
-
 impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
     pub fn new() -> DynamicMVHashMap<K, V> {
         DynamicMVHashMap {
@@ -434,23 +439,15 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
             self.empty.store(0, Ordering::SeqCst);
         }
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(
-            version,
-            WriteCell::new_from(FLAG_DONE, retry_num, data),
-        );
+        map.insert(version, WriteCell::new_from(FLAG_DONE, retry_num, data));
 
         Ok(())
     }
 
     pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
-        if self.empty.load(Ordering::SeqCst) == 1 {
-            self.empty.store(0, Ordering::SeqCst);
-        }
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(
-            version,
-            WriteCell::new_from(FLAG_DIRTY, retry_num, None),
-        );
+        // TODO: just update the entry.
+        map.insert(version, WriteCell::new_from(FLAG_DIRTY, retry_num, None));
 
         Ok(())
     }

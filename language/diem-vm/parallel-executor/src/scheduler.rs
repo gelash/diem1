@@ -1,7 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
-    errors::{Error, Result},
+    errors::Error,
     task::{ExecutionStatus, Transaction, TransactionOutput},
 };
 use arc_swap::ArcSwapOption;
@@ -108,9 +108,8 @@ pub struct Scheduler<K, T, E> {
     txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
     txn_status: Vec<CachePadded<ArcSwapOption<STMStatus<K, T, E>>>>, // version -> execution status.
 
-    // ArcSwap load isn't sequentially consistent, so we separately store latest exec id and
-    // manually synchronize the status with it.
-    exec_id_seqcst: Vec<CachePadded<AtomicUsize>>,
+    // Separately for perf.
+    exec_ids: Vec<CachePadded<AtomicUsize>>,
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
@@ -128,7 +127,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             txn_status: (0..num_txns)
                 .map(|_| CachePadded::new(ArcSwapOption::empty()))
                 .collect(),
-            exec_id_seqcst: (0..num_txns)
+            exec_ids: (0..num_txns)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),
         }
@@ -165,7 +164,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, E>>) -> bool {
-        if let Ok(_) = self.exec_id_seqcst[version].compare_exchange(
+        if let Ok(_) = self.exec_ids[version].compare_exchange(
             cur_status.exec_id(),
             cur_status.exec_id() + 1,
             Ordering::SeqCst,
@@ -198,16 +197,6 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 // Even watermark means awating (re-)execution, not ready to validate.
                 return None;
             }
-            let status = self.txn_status[next_to_val].load_full();
-            if !status.is_some() {
-                // Status not even visible, not ready to validate.
-                return None;
-            }
-            let next_status = status.unwrap();
-            if next_status.exec_id() != exec_id_watermark {
-                // exec_id not matching watermark.
-                return None;
-            }
 
             let num_decrease = val_marker & MASK;
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
@@ -223,7 +212,10 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
             ) {
                 // CAS successful, return index & status.
-                return Some((next_to_val, next_status.clone()));
+                return Some((
+                    next_to_val,
+                    self.txn_status[next_to_val].load_full().unwrap().clone(),
+                ));
             } else {
                 // CAS unsuccessful - not validating next_to_val (will try different index).
                 if self.finish_validation() {
@@ -269,7 +261,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn exec_id(&self, version: usize) -> usize {
-        self.exec_id_seqcst[version].load(Ordering::SeqCst)
+        self.exec_ids[version].load(Ordering::SeqCst)
     }
 
     pub fn output(&self, version: usize) -> ExecutionStatus<T, Error<E>> {
@@ -291,7 +283,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             input,
             output,
         })));
-        self.exec_id_seqcst[version].store(exec_id + 1, Ordering::SeqCst);
+        self.exec_ids[version].store(exec_id + 1, Ordering::SeqCst);
 
         // we want to make things fast inside the lock, so use replace instead of clone
         let mut version_deps: Vec<usize> = {
