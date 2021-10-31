@@ -211,6 +211,8 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 Ordering::SeqCst,  // Keep status stores above.
                 Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
             ) {
+                // Could assert that status retry number isn't lower than watermark
+
                 // CAS successful, return index & status.
                 return Some((
                     next_to_val,
