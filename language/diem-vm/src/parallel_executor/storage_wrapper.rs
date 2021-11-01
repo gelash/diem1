@@ -1,11 +1,12 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::data_cache::RemoteStorage;
+use crate::{data_cache::RemoteStorage, parallel_executor::DiemTransactionOutput};
 use diem_parallel_executor::executor::MVHashMapView;
 use diem_state_view::{StateView, StateViewId};
 use diem_types::{access_path::AccessPath, write_set::WriteOp};
 use move_binary_format::errors::VMError;
+use move_core_types::vm_status::VMStatus;
 use move_core_types::{
     account_address::AccountAddress,
     language_storage::{ModuleId, StructTag},
@@ -14,13 +15,13 @@ use move_core_types::{
 
 pub(crate) struct VersionedView<'a, S: StateView> {
     base_view: &'a S,
-    hashmap_view: &'a MVHashMapView<'a, AccessPath, WriteOp>,
+    hashmap_view: &'a MVHashMapView<'a, AccessPath, WriteOp, DiemTransactionOutput, VMStatus>,
 }
 
 impl<'a, S: StateView> VersionedView<'a, S> {
     pub fn new_view(
         base_view: &'a S,
-        hashmap_view: &'a MVHashMapView<'a, AccessPath, WriteOp>,
+        hashmap_view: &'a MVHashMapView<'a, AccessPath, WriteOp, DiemTransactionOutput, VMStatus>,
     ) -> VersionedView<'a, S> {
         VersionedView {
             base_view,

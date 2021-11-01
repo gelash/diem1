@@ -10,7 +10,7 @@ use crossbeam_queue::SegQueue;
 use mvhashmap::Version;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 
 const MASK: u64 = ((1 as u64) << 32) - 1;
@@ -51,7 +51,8 @@ pub struct STMStatus<K, T, E> {
     // Transactions input/output set from the last execution (for all actual reads and writes),
     // plus a bit to (test-and-set) synchronize among failed validators (so only one can abort).
     input: Vec<ReadDescriptor<K>>,
-    output: ExecutionStatus<T, Error<E>>,
+    // Can take once.
+    output: RwLock<Option<ExecutionStatus<T, Error<E>>>>,
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
@@ -71,8 +72,8 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
         <<T as TransactionOutput>::T as Transaction>::Key,
         <<T as TransactionOutput>::T as Transaction>::Value,
     )> {
-        let output = &self.output;
-        let t = match output {
+        let output = self.output.read().unwrap();
+        let t = match output.as_ref().unwrap() {
             ExecutionStatus::Success(t) => t,
             ExecutionStatus::SkipRest(t) => t,
             ExecutionStatus::Abort(err) => return Vec::new(),
@@ -81,7 +82,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
     }
 
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
-        self.output.clone()
+        self.output.write().unwrap().take().unwrap()
     }
 }
 
@@ -283,7 +284,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         self.txn_status[version].store(Some(Arc::new(STMStatus {
             exec_id: exec_id + 1,
             input,
-            output,
+            output: RwLock::new(Some(output)),
         })));
         self.exec_ids[version].store(exec_id + 1, Ordering::SeqCst);
 

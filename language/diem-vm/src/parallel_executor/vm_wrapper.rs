@@ -36,7 +36,7 @@ impl<'a, S: 'a + StateView> ExecutorTask for DiemVMWrapper<'a, S> {
 
     fn execute_transaction(
         &self,
-        view: &MVHashMapView<AccessPath, WriteOp>,
+        view: &MVHashMapView<AccessPath, WriteOp, DiemTransactionOutput, VMStatus>,
         txn: &PreprocessedTransaction,
     ) -> ExecutionStatus<DiemTransactionOutput, VMStatus> {
         let log_context = AdapterLogSchema::new(self.base_view.id(), view.version());

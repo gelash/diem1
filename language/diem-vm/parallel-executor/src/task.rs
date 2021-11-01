@@ -69,13 +69,18 @@ pub trait ExecutorTask: Sync {
     /// Execute one single transaction given the view of the current state.
     fn execute_transaction(
         &self,
-        view: &MVHashMapView<<Self::T as Transaction>::Key, <Self::T as Transaction>::Value, Self::Output, Self::Error>,
+        view: &MVHashMapView<
+            <Self::T as Transaction>::Key,
+            <Self::T as Transaction>::Value,
+            Self::Output,
+            Self::Error,
+        >,
         txn: &Self::T,
     ) -> ExecutionStatus<Self::Output, Self::Error>;
 }
 
 /// Trait for execution result of a transaction.
-pub trait TransactionOutput: Send + Sync + Clone {
+pub trait TransactionOutput: Send + Sync {
     /// Type of transaction and its associated key and value.
     type T: Transaction;
 
