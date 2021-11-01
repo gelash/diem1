@@ -180,9 +180,9 @@ checksum = "db55d72333851e17d572bec876e390cd3b11eb1ef53ae821dd9f3b653d2b4569"
 
 [[package]]
 name = "arc-swap"
-version = "1.2.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4d7d63395147b81a9e570bcc6243aaf71c017bd666d4909cfef0085bdda8d73"
+checksum = "e6df5aef5c5830360ce5218cecb8f018af3438af5686ae945094affc86fdec63"
 
 [[package]]
 name = "array_tool"
@@ -1457,6 +1457,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e77a43b28d0668df09411cb0bc9a8c2adc40f9a048afe863e05fd43251e8e39c"
+dependencies = [
+ "cfg-if 1.0.0",
+ "num_cpus",
+]
+
+[[package]]
 name = "data-streaming-service"
 version = "0.1.0"
 dependencies = [
@@ -2407,9 +2417,13 @@ name = "diem-parallel-executor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "criterion",
+ "crossbeam",
  "crossbeam-queue",
+ "diem-types",
  "diem-workspace-hack",
+ "move-core-types",
  "mvhashmap",
  "num_cpus",
  "once_cell",
@@ -4314,7 +4328,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84361d019110e87ee0b527edae8cba07feb78a09c53d8579e5411005d0ad5065"
 dependencies = [
- "dashmap",
+ "dashmap 3.11.10",
  "hashbrown 0.9.1",
  "once_cell",
 ]
@@ -5458,6 +5472,8 @@ dependencies = [
 name = "mvhashmap"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "dashmap 4.0.2",
  "diem-workspace-hack",
  "num_cpus",
  "once_cell",

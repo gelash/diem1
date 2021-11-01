@@ -4,7 +4,8 @@
 use crate::{
     executor::ParallelTransactionExecutor,
     proptest_types::types::{
-        ExpectedOutput, Inferencer, Task, Transaction, TransactionGen, TransactionGenParams,
+        ExpectedOutput, Inferencer, STMInferencer, Task, Transaction, TransactionGen,
+        TransactionGenParams,
     },
 };
 use criterion::{BatchSize, Bencher as CBencher};
@@ -24,11 +25,15 @@ pub struct Bencher<K, V> {
     universe_size: usize,
     phantom_key: PhantomData<K>,
     phantom_value: PhantomData<V>,
+    drop_write: f64,
+    drop_read: f64,
 }
 
 pub(crate) struct BencherState<K, V> {
     transactions: Vec<Transaction<K, V>>,
     expected_output: Option<ExpectedOutput<V>>,
+    drop_write: f64,
+    drop_read: f64,
 }
 
 impl<K, V> Bencher<K, V>
@@ -36,13 +41,20 @@ where
     K: Hash + Clone + Debug + Eq + Send + Sync + PartialOrd + Ord + Arbitrary + 'static,
     V: Clone + Eq + Send + Sync + Arbitrary + 'static,
 {
-    pub fn new(transaction_size: usize, universe_size: usize) -> Self {
+    pub fn new(
+        transaction_size: usize,
+        universe_size: usize,
+        drop_write: f64,
+        drop_read: f64,
+    ) -> Self {
         Self {
             transaction_size,
             transaction_gen_param: TransactionGenParams::default(),
             universe_size,
             phantom_key: PhantomData,
             phantom_value: PhantomData,
+            drop_write,
+            drop_read,
         }
     }
 
@@ -53,7 +65,9 @@ where
                     vec(key_strategy, self.universe_size),
                     self.transaction_size,
                     self.transaction_gen_param,
-                    false,
+                    true,
+                    self.drop_write,
+                    self.drop_read,
                 )
             },
             |state| state.run(),
@@ -75,6 +89,8 @@ where
         num_transactions: usize,
         transaction_params: TransactionGenParams,
         check_correctness: bool,
+        drop_write: f64,
+        drop_read: f64,
     ) -> Self {
         let mut runner = TestRunner::default();
         let key_universe = universe_strategy
@@ -104,18 +120,31 @@ where
         Self {
             transactions,
             expected_output,
+            drop_write,
+            drop_read,
         }
     }
 
     pub(crate) fn run(self) {
+        // let txns = self.transactions.clone();
+        // for id in 0..txns.len() {
+        //     println!("id {}", id);
+        //     if let Transaction::Write { actual_writes, skipped_writes, reads } = &txns[id] {
+        //         println!("actual writes {:?}", actual_writes);
+        //         println!("skipped writes {:?}", skipped_writes);
+        //         println!("reads {:?}\n", reads);
+        //     }
+        // }
+
         let output =
-            ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, Inferencer<K, V>>::new(
-                Inferencer::new(),
+            ParallelTransactionExecutor::<Transaction<K, V>, Task<K, V>, STMInferencer<K, V>>::new(
+                STMInferencer::new(self.drop_write, self.drop_read),
             )
             .execute_transactions_parallel((), self.transactions);
 
         if let Some(expected_output) = self.expected_output {
-            assert!(expected_output.check_output(&output))
+            assert!(expected_output.check_output(&output));
+            println!("Parallel execution same as sequential execution!");
         }
     }
 }
