@@ -205,9 +205,9 @@ where
         let (versioned_data_cache, max_dependency_level) =
             MVHashMap::new_from_parallel(path_version_tuples);
 
-        if max_dependency_level == 0 {
-            return Err(Error::InferencerError);
-        }
+        // if max_dependency_level == 0 {
+        //     return Err(Error::InferencerError);
+        // }
 
         let outcomes = OutcomeArray::new(num_txns);
 

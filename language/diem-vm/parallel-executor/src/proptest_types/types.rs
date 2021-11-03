@@ -14,13 +14,13 @@ use proptest::{
     arbitrary::Arbitrary, collection::vec, prelude::*, proptest, sample::Index, strategy::Strategy,
 };
 use proptest_derive::Arbitrary;
+use rand::Rng;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Debug,
     hash::Hash,
     marker::PhantomData,
 };
-use rand::Rng;
 
 ///////////////////////////////////////////////////////////////////////////
 // Generation of transactions
@@ -234,7 +234,7 @@ where
                 let mut writes_result = Vec::new();
                 let mut reads_result = Vec::new();
                 let mut rng = rand::thread_rng(); // randomness
-                
+
                 for write in writes {
                     if rng.gen_range(0.0..10.0) / 10.0 > self.1 {
                         writes_result.push(write.clone());
@@ -399,19 +399,19 @@ impl<V: Clone + Eq + Debug> ExpectedOutput<V> {
                 }
                 return true;
             }
-                // expected_results
-                // .iter()
-                // .zip(results.iter())
-                // .all(|(expected_result, Output(_, result))| {
-                //     if expected_result == result {
-                //         return true;
-                //     } else {
-                //         println!("expect: {:?}", expected_result);
-                //         println!("result: {:?}\n", result);
-                //         return false;
-                //     }
-                //     // return expected_result == result;
-                // }),
+            // expected_results
+            // .iter()
+            // .zip(results.iter())
+            // .all(|(expected_result, Output(_, result))| {
+            //     if expected_result == result {
+            //         return true;
+            //     } else {
+            //         println!("expect: {:?}", expected_result);
+            //         println!("result: {:?}\n", result);
+            //         return false;
+            //     }
+            //     // return expected_result == result;
+            // }),
             _ => false,
         }
     }

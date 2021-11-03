@@ -135,9 +135,8 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn decrease_validation_marker(&self, target_version: usize) {
+        let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
         loop {
-            let val_marker = self.validation_marker.load(Ordering::SeqCst);
-
             let val_version = val_marker >> 32;
 
             if (val_version as usize) < target_version {
@@ -152,14 +151,19 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             let new_num_decrease = (val_marker & MASK) + 1;
             let new_marker = (((target_version as u64) << 32) as u64) | new_num_decrease;
 
-            if let Ok(_) = self.validation_marker.compare_exchange_weak(
+            match self.validation_marker.compare_exchange_weak(
                 val_marker,
                 new_marker,
                 Ordering::SeqCst, // Make sure my decrease is sequentially consistent.
-                Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
+                Ordering::SeqCst, // Re-read w. seqcst semantics
             ) {
-                // Successfully updated.
-                return;
+                Ok(_) => {
+                    // Successfully updated.
+                    return;
+                }
+                Err(x) => {
+                    val_marker = x;
+                }
             }
         }
     }
@@ -182,10 +186,10 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
     // Return the next txn version & status for the thread to validate.
     pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
-        loop {
-            // Read val_marker, seq cst ordered for status reads (here below).
-            let val_marker = self.validation_marker.load(Ordering::SeqCst);
+        // Read val_marker, seq cst ordered for status reads (here below).
+        let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
 
+        loop {
             let next_to_val = (val_marker >> 32) as usize;
             if next_to_val >= self.num_txn_to_execute() {
                 return None;
@@ -206,23 +210,27 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             self.num_validating.fetch_add(1, Ordering::SeqCst);
 
             // CAS to win the competition to actually validate next_to_val.
-            if let Ok(_) = self.validation_marker.compare_exchange_weak(
+            match self.validation_marker.compare_exchange_weak(
                 val_marker,
                 new_marker,
-                Ordering::SeqCst,  // Keep status stores above.
-                Ordering::Relaxed, // Sufficient due to loop, semantics, and prior read.
+                Ordering::SeqCst, // Keep status stores above.
+                Ordering::SeqCst, // Re-read w. seqcst semantics
             ) {
-                // Could assert that status retry number isn't lower than watermark
+                Ok(_) => {
+                    // Could assert that status retry number isn't lower than watermark
 
-                // CAS successful, return index & status.
-                return Some((
-                    next_to_val,
-                    self.txn_status[next_to_val].load_full().unwrap().clone(),
-                ));
-            } else {
-                // CAS unsuccessful - not validating next_to_val (will try different index).
-                if self.finish_validation() {
-                    self.check_done();
+                    // CAS successful, return index & status.
+                    return Some((
+                        next_to_val,
+                        self.txn_status[next_to_val].load_full().unwrap().clone(),
+                    ));
+                }
+                Err(x) => {
+                    // CAS unsuccessful - not validating next_to_val (will try different index).
+                    if self.finish_validation() {
+                        self.check_done();
+                    }
+                    val_marker = x;
                 }
             }
         }
