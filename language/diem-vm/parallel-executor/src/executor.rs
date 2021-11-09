@@ -565,12 +565,15 @@ where
             d_max, d_avg
         );
 
+        let ret = outcomes.get_all_results(valid_results_length);
+
         ::std::thread::spawn(move || {
-            // drop(scheduler);
             drop(infer_result);
             drop(signature_verified_block); // Explicit drops to measure their cost.
             drop(versioned_data_cache);
         });
+
+        drop(scheduler);
 
         let remaining_time = timer.elapsed();
         let total_time = timer_start.elapsed();
@@ -579,6 +582,6 @@ where
 
         // scheduler.print_info();
 
-        outcomes.get_all_results(valid_results_length)
+        ret
     }
 }

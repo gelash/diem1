@@ -17,6 +17,7 @@ use proptest::{
 };
 use read_write_set::analyze;
 use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
+use std::time::{Duration, Instant};
 
 /// Benchmarking support for transactions.
 #[derive(Clone, Debug)]
@@ -88,6 +89,28 @@ where
             // The input here is the entire list of signed transactions, so it's pretty large.
             BatchSize::LargeInput,
         )
+    }
+
+    /// Runs the bencher.
+    pub fn manual_parallel(&self) -> Vec<usize> {
+        let mut ret = Vec::new();
+
+        for i in 0..13 {
+            let state = ParallelBenchState::with_size(
+                &self.strategy,
+                self.num_accounts,
+                self.num_transactions,
+            );
+
+            if i < 3 {
+                state.execute();
+            } else {
+                ret.push(state.execute());
+            }
+        }
+
+        // ret.sort();
+        ret
     }
 }
 
@@ -203,16 +226,16 @@ impl ParallelBenchState {
         }
     }
 
-    fn execute(self) {
-        ParallelDiemVM::execute_block(
-            &self.infer_results,
-            self.bench_state
-                .transactions
-                .into_iter()
-                .map(Transaction::UserTransaction)
-                .collect(),
-            self.bench_state.executor.get_state_view(),
-        )
-        .expect("VM should not fail to start");
+    fn execute(self) -> usize {
+        let txns = self
+            .bench_state
+            .transactions
+            .into_iter()
+            .map(Transaction::UserTransaction)
+            .collect();
+        let state_view = self.bench_state.executor.get_state_view();
+        // measured - microseconds.
+
+        ParallelDiemVM::execute_block_timer(&self.infer_results, txns, state_view)
     }
 }

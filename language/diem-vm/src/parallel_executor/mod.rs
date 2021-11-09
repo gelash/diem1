@@ -28,6 +28,7 @@ use diem_types::{
 use move_core_types::vm_status::{StatusCode, VMStatus};
 use rayon::prelude::*;
 use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
+use std::time::{Duration, Instant};
 
 impl PTransaction for PreprocessedTransaction {
     type Key = AccessPath;
@@ -79,32 +80,112 @@ impl ParallelDiemVM {
         // This is time consuming so don't wait and do the checking
         // sequentially while executing the transactions.
 
+        // let mut timer = Instant::now();
         let signature_verified_block: Vec<PreprocessedTransaction> = transactions
             .par_iter()
             .map(|txn| preprocess_transaction::<DiemVM>(txn.clone()))
             .collect();
+        // println!("CLONE & Prologue {:?}", timer.elapsed());
 
-        match ParallelTransactionExecutor::<
+        let timer = Instant::now();
+        let executor = ParallelTransactionExecutor::<
             PreprocessedTransaction,
             DiemVMWrapper<S>,
             ReadWriteSetAnalysisWrapper<RemoteStorage<S>>,
-        >::new(analyzer)
-        .execute_transactions_parallel(state_view, signature_verified_block)
+        >::new(analyzer);
+        let ret = match executor.execute_transactions_parallel(state_view, signature_verified_block)
         {
-            Ok(results) => Ok((
-                results
-                    .into_iter()
-                    .map(DiemTransactionOutput::into)
-                    .collect(),
-                None,
-            )),
+            Ok(results) => {
+                Ok((
+                    results
+                        .into_iter()
+                        .map(DiemTransactionOutput::into)
+                        .collect(),
+                    None,
+                ))
+                // let timer1 = Instant::now();
+                // drop(transactions);
+                // println!("DROP TXN {:?}", timer1.elapsed());
+            }
             Err(err @ Error::InferencerError) | Err(err @ Error::UnestimatedWrite) => {
-                Ok((DiemVM::execute_block(transactions, state_view)?, Some(err)))
+                panic!();
+                // Ok((DiemVM::execute_block(transactions, state_view)?, Some(err)))
             }
             Err(Error::InvariantViolation) => Err(VMStatus::Error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
             )),
             Err(Error::UserError(err)) => Err(err),
-        }
+        };
+        // drop(executor);
+        // drop(blockchain_view);
+        // println!("PARALLEL EXECUTE OUTSIDE {:?}", timer.elapsed());
+
+        ret
+    }
+
+    pub fn execute_block_timer<S: StateView>(
+        analysis_result: &NormalizedReadWriteSetAnalysis,
+        transactions: Vec<Transaction>,
+        state_view: &S,
+    ) -> usize {
+        let blockchain_view = RemoteStorage::new(state_view);
+        let analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
+
+        // Verify the signatures of all the transactions in parallel.
+        // This is time consuming so don't wait and do the checking
+        // sequentially while executing the transactions.
+
+        // let mut timer = Instant::now();
+        let signature_verified_block: Vec<PreprocessedTransaction> = transactions
+            .par_iter()
+            .map(|txn| preprocess_transaction::<DiemVM>(txn.clone()))
+            .collect();
+        // println!("CLONE & Prologue {:?}", timer.elapsed());
+
+        let executor = ParallelTransactionExecutor::<
+            PreprocessedTransaction,
+            DiemVMWrapper<S>,
+            ReadWriteSetAnalysisWrapper<RemoteStorage<S>>,
+        >::new(analyzer);
+
+        let timer = Instant::now();
+        executor.execute_transactions_parallel(state_view, signature_verified_block);
+
+        //     Ok(results) => {
+        //         // let _a = Ok((
+        //         // results
+        //         // .into_iter()
+        //         // .map(DiemTransactionOutput::into)
+        //         // .collect(),
+        //         // None,
+        //         // ));
+
+        //         // let timer1 = Instant::now();
+        //         // drop(transactions);
+        //         // println!("DROP TXN {:?}", timer1.elapsed());
+        //     }
+        //     Err(err @ Error::InferencerError) | Err(err @ Error::UnestimatedWrite) => {
+        //         panic!();
+        //         // Ok((DiemVM::execute_block(transactions, state_view)?, Some(err)))
+        //     }
+        //     Err(Error::InvariantViolation) => {
+        //         panic!();
+        //         // Err(VMStatus::Error(
+        //         // StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+        //         // )),
+        //     }
+        //     Err(Error::UserError(err)) => {
+        //         panic!();
+        //         // Err(err),
+        //     }
+        // };
+        // drop(executor);
+        // drop(blockchain_view);
+        // println!("PARALLEL EXECUTE OUTSIDE {:?}", timer.elapsed());
+
+        let t = timer.elapsed();
+        println!("PARALLEL EXECUTE OUTSIDE {:?}", t);
+
+        t.as_millis() as usize
     }
 }
