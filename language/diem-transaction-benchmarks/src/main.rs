@@ -4,6 +4,8 @@ use proptest::prelude::*;
 
 fn main() {
     let bencher = TransactionBencher::new(any_with::<P2PTransferGen>((1_000, 1_000_000)));
-    let measurements = bencher.manual_parallel();
+
+    let mut measurements = bencher.manual_parallel();
+    measurements.sort();
     println!("{:?}", measurements);
 }

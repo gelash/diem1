@@ -148,43 +148,14 @@ impl ParallelDiemVM {
             ReadWriteSetAnalysisWrapper<RemoteStorage<S>>,
         >::new(analyzer);
 
-        let timer = Instant::now();
-        executor.execute_transactions_parallel(state_view, signature_verified_block);
-
-        //     Ok(results) => {
-        //         // let _a = Ok((
-        //         // results
-        //         // .into_iter()
-        //         // .map(DiemTransactionOutput::into)
-        //         // .collect(),
-        //         // None,
-        //         // ));
-
-        //         // let timer1 = Instant::now();
-        //         // drop(transactions);
-        //         // println!("DROP TXN {:?}", timer1.elapsed());
-        //     }
-        //     Err(err @ Error::InferencerError) | Err(err @ Error::UnestimatedWrite) => {
-        //         panic!();
-        //         // Ok((DiemVM::execute_block(transactions, state_view)?, Some(err)))
-        //     }
-        //     Err(Error::InvariantViolation) => {
-        //         panic!();
-        //         // Err(VMStatus::Error(
-        //         // StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-        //         // )),
-        //     }
-        //     Err(Error::UserError(err)) => {
-        //         panic!();
-        //         // Err(err),
-        //     }
-        // };
-        // drop(executor);
-        // drop(blockchain_view);
-        // println!("PARALLEL EXECUTE OUTSIDE {:?}", timer.elapsed());
-
+        let mut timer = Instant::now();
+        let useless = executor.execute_transactions_parallel(state_view, signature_verified_block);
         let t = timer.elapsed();
-        println!("PARALLEL EXECUTE OUTSIDE {:?}", t);
+        // println!("PARALLEL EXECUTE OUTSIDE {:?}", t);
+
+        // timer = Instant::now();
+        drop(useless);
+        // println!("DROPPING RESULT {:?}", timer.elapsed());
 
         t.as_millis() as usize
     }
