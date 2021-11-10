@@ -17,7 +17,10 @@ use crate::{
 use diem_parallel_executor::{
     errors::Error,
     executor::ParallelTransactionExecutor,
-    task::{Transaction as PTransaction, TransactionOutput as PTransactionOutput},
+    task::{
+        ReadWriteSetInferencer, Transaction as PTransaction,
+        TransactionOutput as PTransactionOutput,
+    },
 };
 use diem_state_view::StateView;
 use diem_types::{
@@ -74,7 +77,7 @@ impl ParallelDiemVM {
         state_view: &S,
     ) -> Result<(Vec<TransactionOutput>, Option<Error<VMStatus>>), VMStatus> {
         let blockchain_view = RemoteStorage::new(state_view);
-        let analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
+        let mut analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
 
         // Verify the signatures of all the transactions in parallel.
         // This is time consuming so don't wait and do the checking
@@ -87,12 +90,14 @@ impl ParallelDiemVM {
             .collect();
         // println!("CLONE & Prologue {:?}", timer.elapsed());
 
-        let timer = Instant::now();
+        analyzer.infer_results(&signature_verified_block, 1.0);
+
         let executor = ParallelTransactionExecutor::<
             PreprocessedTransaction,
             DiemVMWrapper<S>,
             ReadWriteSetAnalysisWrapper<RemoteStorage<S>>,
         >::new(analyzer);
+
         let ret = match executor.execute_transactions_parallel(state_view, signature_verified_block)
         {
             Ok(results) => {
@@ -127,9 +132,10 @@ impl ParallelDiemVM {
         analysis_result: &NormalizedReadWriteSetAnalysis,
         transactions: Vec<Transaction>,
         state_view: &S,
-    ) -> usize {
+        write_keep_rate: f32,
+    ) -> (usize, usize) {
         let blockchain_view = RemoteStorage::new(state_view);
-        let analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
+        let mut analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
 
         // Verify the signatures of all the transactions in parallel.
         // This is time consuming so don't wait and do the checking
@@ -142,21 +148,20 @@ impl ParallelDiemVM {
             .collect();
         // println!("CLONE & Prologue {:?}", timer.elapsed());
 
+        let analysis_time = analyzer.infer_results(&signature_verified_block, write_keep_rate);
+
         let executor = ParallelTransactionExecutor::<
             PreprocessedTransaction,
             DiemVMWrapper<S>,
             ReadWriteSetAnalysisWrapper<RemoteStorage<S>>,
         >::new(analyzer);
 
-        let mut timer = Instant::now();
+        let timer = Instant::now();
         let useless = executor.execute_transactions_parallel(state_view, signature_verified_block);
-        let t = timer.elapsed();
-        // println!("PARALLEL EXECUTE OUTSIDE {:?}", t);
+        let exec_t = timer.elapsed();
 
-        // timer = Instant::now();
         drop(useless);
-        // println!("DROPPING RESULT {:?}", timer.elapsed());
 
-        t.as_millis() as usize
+        (exec_t.as_millis() as usize, analysis_time)
     }
 }

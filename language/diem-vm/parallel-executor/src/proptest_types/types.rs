@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use anyhow::Result as AResult;
+// use diem_types::access_path::AccessPath;
 use proptest::{
     arbitrary::Arbitrary, collection::vec, prelude::*, proptest, sample::Index, strategy::Strategy,
 };
@@ -156,6 +157,24 @@ where
             }),
         }
     }
+
+    fn infer_results(&mut self, block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+        // For this one dropping estimates is implemented elsewhere.
+        0
+    }
+
+    fn result(&self, block: &Vec<Self::T>) -> Vec<Accesses<K>> {
+        match block
+            .iter()
+            .map(|txn| self.infer_reads_writes(txn))
+            .collect::<AResult<Vec<_>>>()
+        {
+            Ok(res) => res,
+            // Inferencer passed in by user failed to get the read/writeset of a transaction,
+            // abort parallel execution.
+            Err(_) => panic!(),
+        }
+    }
 }
 
 pub struct ImpreciseInferencer<K, V>(PhantomData<(K, V)>);
@@ -199,6 +218,24 @@ where
                 keys_read: vec![],
                 keys_written: vec![],
             }),
+        }
+    }
+
+    fn infer_results(&mut self, _block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+        // For this one dropping estimates is implemented elsewhere.
+        0
+    }
+
+    fn result(&self, block: &Vec<Self::T>) -> Vec<Accesses<K>> {
+        match block
+            .iter()
+            .map(|txn| self.infer_reads_writes(txn))
+            .collect::<AResult<Vec<_>>>()
+        {
+            Ok(res) => res,
+            // Inferencer passed in by user failed to get the read/writeset of a transaction,
+            // abort parallel execution.
+            Err(_) => panic!(),
         }
     }
 }
@@ -256,6 +293,24 @@ where
                 keys_read: vec![],
                 keys_written: vec![],
             }),
+        }
+    }
+
+    fn infer_results(&mut self, _block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+        // For this one dropping estimates is implemented elsewhere.
+        0
+    }
+
+    fn result(&self, block: &Vec<Self::T>) -> Vec<Accesses<K>> {
+        match block
+            .iter()
+            .map(|txn| self.infer_reads_writes(txn))
+            .collect::<AResult<Vec<_>>>()
+        {
+            Ok(res) => res,
+            // Inferencer passed in by user failed to get the read/writeset of a transaction,
+            // abort parallel execution.
+            Err(_) => panic!(),
         }
     }
 }

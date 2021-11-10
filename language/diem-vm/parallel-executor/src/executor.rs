@@ -169,20 +169,23 @@ where
         let num_txns = signature_verified_block.len();
         let chunks_size = max(1, num_txns / self.num_cpus);
 
+        // let timer1 = Instant::now();
         // Get the read and write dependency for each transaction.
-        let infer_result: Vec<_> = {
-            match signature_verified_block
-                .par_iter()
-                .with_min_len(chunks_size)
-                .map(|txn| self.inferencer.infer_reads_writes(txn))
-                .collect::<AResult<Vec<_>>>()
-            {
-                Ok(res) => res,
-                // Inferencer passed in by user failed to get the read/writeset of a transaction,
-                // abort parallel execution.
-                Err(_) => return Err(Error::InferencerError),
-            }
-        };
+        let infer_result = self.inferencer.result(&signature_verified_block);
+        // Vec<_> = {
+        //     match signature_verified_block
+        //         .par_iter()
+        //         .with_min_len(chunks_size)
+        //         .map(|txn| self.inferencer.infer_reads_writes(txn))
+        //         .collect::<AResult<Vec<_>>>()
+        //     {
+        //         Ok(res) => res,
+        //         // Inferencer passed in by user failed to get the read/writeset of a transaction,
+        //         // abort parallel execution.
+        //         Err(_) => return Err(Error::InferencerError),
+        //     }
+        // };
+        // println!("Inferencer Call {:?}", timer1.elapsed());
 
         // Use write analysis result to construct placeholders.
         let path_version_tuples: Vec<(T::Key, usize)> = infer_result
@@ -235,7 +238,9 @@ where
             // How many threads to use?
             // let compute_cpus = min(1 + (num_txns / 50), self.num_cpus - 1); // Ensure we have at least 50 tx per thread.
             // let compute_cpus = min(num_txns / max(max_dependency_level, 1), compute_cpus); // Ensure we do not higher rate of conflict than concurrency.
-            let compute_cpus = 7;
+            // let compute_cpus = 7;
+
+            let compute_cpus = self.num_cpus / 2;
 
             println!(
                 "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}",

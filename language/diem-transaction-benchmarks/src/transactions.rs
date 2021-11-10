@@ -83,6 +83,7 @@ where
                     &self.strategy,
                     self.num_accounts,
                     self.num_transactions,
+                    1.0,
                 )
             },
             |state| state.execute(),
@@ -92,14 +93,20 @@ where
     }
 
     /// Runs the bencher.
-    pub fn manual_parallel(&self) -> Vec<usize> {
+    pub fn manual_parallel(
+        &self,
+        num_accounts: usize,
+        num_txn: usize,
+        write_keep_rate: f32,
+    ) -> Vec<(usize, usize)> {
         let mut ret = Vec::new();
 
         for i in 0..13 {
             let state = ParallelBenchState::with_size(
                 &self.strategy,
-                self.num_accounts,
-                self.num_transactions,
+                num_accounts,
+                num_txn,
+                write_keep_rate,
             );
 
             if i < 3 {
@@ -205,11 +212,17 @@ fn universe_strategy(
 struct ParallelBenchState {
     bench_state: TransactionBenchState,
     infer_results: NormalizedReadWriteSetAnalysis,
+    write_keep_rate: f32,
 }
 
 impl ParallelBenchState {
     /// Creates a new benchmark state with the given number of accounts and transactions.
-    fn with_size<S>(strategy: S, num_accounts: usize, num_transactions: usize) -> Self
+    fn with_size<S>(
+        strategy: S,
+        num_accounts: usize,
+        num_transactions: usize,
+        write_keep_rate: f32,
+    ) -> Self
     where
         S: Strategy,
         S::Value: AUTransactionGen,
@@ -223,10 +236,11 @@ impl ParallelBenchState {
             infer_results: analyze(current_modules().iter())
                 .unwrap()
                 .normalize_all_scripts(add_on_functions_list()),
+            write_keep_rate,
         }
     }
 
-    fn execute(self) -> usize {
+    fn execute(self) -> (usize, usize) {
         let txns = self
             .bench_state
             .transactions
@@ -236,6 +250,11 @@ impl ParallelBenchState {
         let state_view = self.bench_state.executor.get_state_view();
         // measured - microseconds.
 
-        ParallelDiemVM::execute_block_timer(&self.infer_results, txns, state_view)
+        ParallelDiemVM::execute_block_timer(
+            &self.infer_results,
+            txns,
+            state_view,
+            self.write_keep_rate,
+        )
     }
 }
