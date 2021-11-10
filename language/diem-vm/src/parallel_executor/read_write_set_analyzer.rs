@@ -48,7 +48,7 @@ impl<'a, S: MoveResolver + std::marker::Sync> ReadWriteSetInferencer
 
     fn infer_results(&mut self, block: &Vec<Self::T>, write_keep_rate: f32) -> usize {
         let num_txns = block.len();
-        let chunks_size = max(1, 2 * num_txns / num_cpus::get());
+        let chunks_size = max(1, num_txns / num_cpus::get());
 
         let timer = Instant::now();
         // Get the read and write dependency for each transaction.

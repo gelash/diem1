@@ -12,9 +12,9 @@ fn main() {
 
     let mut measurements = Vec::new();
 
-    for write_rate in writes {
+    for block_size in txns {
         for num_accounts in acts {
-            for block_size in txns {
+            for write_rate in writes {
                 let mut times = bencher.manual_parallel(num_accounts, block_size, write_rate);
                 times.sort();
                 measurements.push(times);
@@ -22,12 +22,12 @@ fn main() {
         }
     }
 
-    println!("CPUS = {}", num_cpus::get() / 2);
+    println!("CPUS = {}", num_cpus::get());
 
     let mut i = 0;
-    for write_rate in writes {
+    for block_size in txns {
         for num_accounts in acts {
-            for block_size in txns {
+            for write_rate in writes {
                 println!(
                     "keep write rate = {:?}, num act = {}, num txns in block = {}",
                     write_rate, num_accounts, block_size
