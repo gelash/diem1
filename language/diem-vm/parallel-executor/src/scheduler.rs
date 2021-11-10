@@ -76,7 +76,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
         let t = match output.as_ref().unwrap() {
             ExecutionStatus::Success(t) => t,
             ExecutionStatus::SkipRest(t) => t,
-            ExecutionStatus::Abort(err) => return Vec::new(),
+            ExecutionStatus::Abort(_) => return Vec::new(),
         };
         return t.get_writes();
     }

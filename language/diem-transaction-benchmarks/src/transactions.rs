@@ -17,7 +17,7 @@ use proptest::{
 };
 use read_write_set::analyze;
 use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
-use std::time::{Duration, Instant};
+// use std::time::Instant;
 
 /// Benchmarking support for transactions.
 #[derive(Clone, Debug)]

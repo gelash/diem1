@@ -1,5 +1,6 @@
 use diem_transaction_benchmarks::transactions::TransactionBencher;
 use language_e2e_tests::account_universe::P2PTransferGen;
+use num_cpus;
 use proptest::prelude::*;
 
 fn main() {
@@ -20,6 +21,8 @@ fn main() {
             }
         }
     }
+
+    println!("CPUS = {}", num_cpus::get() / 2);
 
     let mut i = 0;
     for write_rate in writes {

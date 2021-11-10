@@ -12,7 +12,7 @@ use crate::{
     parallel_executor::{
         read_write_set_analyzer::ReadWriteSetAnalysisWrapper, vm_wrapper::DiemVMWrapper,
     },
-    VMExecutor,
+    // VMExecutor,
 };
 use diem_parallel_executor::{
     errors::Error,
@@ -31,7 +31,7 @@ use diem_types::{
 use move_core_types::vm_status::{StatusCode, VMStatus};
 use rayon::prelude::*;
 use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 impl PTransaction for PreprocessedTransaction {
     type Key = AccessPath;
@@ -112,7 +112,7 @@ impl ParallelDiemVM {
                 // drop(transactions);
                 // println!("DROP TXN {:?}", timer1.elapsed());
             }
-            Err(err @ Error::InferencerError) | Err(err @ Error::UnestimatedWrite) => {
+            Err(_err @ Error::InferencerError) | Err(_err @ Error::UnestimatedWrite) => {
                 panic!();
                 // Ok((DiemVM::execute_block(transactions, state_view)?, Some(err)))
             }

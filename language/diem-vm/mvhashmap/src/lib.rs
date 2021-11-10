@@ -311,7 +311,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         Ok(())
     }
 
-    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+    pub fn set_dirty(&self, key: &K, version: Version, _retry_num: usize) -> Result<(), Error> {
         let entry = self.get_entry(key, version)?;
 
         entry.flag.store(FLAG_DIRTY, Ordering::SeqCst);

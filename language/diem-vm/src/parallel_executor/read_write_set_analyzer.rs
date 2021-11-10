@@ -4,20 +4,15 @@
 use crate::{
     adapter_common::PreprocessedTransaction, read_write_set_analysis::ReadWriteSetAnalysis,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use diem_parallel_executor::task::{Accesses, ReadWriteSetInferencer};
 use diem_types::access_path::AccessPath;
 use move_core_types::resolver::MoveResolver;
 use num_cpus;
 use rand::Rng;
-use rayon::{prelude::*, scope};
+use rayon::prelude::*;
 use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
-use std::{
-    cell::RefCell,
-    cmp::{max, min},
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, cmp::max, sync::Mutex, time::Instant};
 
 pub(crate) struct ReadWriteSetAnalysisWrapper<'a, S: MoveResolver> {
     analyzer: ReadWriteSetAnalysis<'a, S>,
@@ -53,7 +48,7 @@ impl<'a, S: MoveResolver + std::marker::Sync> ReadWriteSetInferencer
 
     fn infer_results(&mut self, block: &Vec<Self::T>, write_keep_rate: f32) -> usize {
         let num_txns = block.len();
-        let chunks_size = max(1, num_txns / num_cpus::get());
+        let chunks_size = max(1, 2 * num_txns / num_cpus::get());
 
         let timer = Instant::now();
         // Get the read and write dependency for each transaction.
