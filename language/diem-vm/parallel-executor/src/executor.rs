@@ -217,7 +217,7 @@ where
         let scheduler = Scheduler::new(num_txns);
 
         let delay_execution_counter = AtomicUsize::new(0);
-        let re_execution_counter = AtomicUsize::new(0);
+        let abort_counter = AtomicUsize::new(0);
         let validation_counter = AtomicUsize::new(0);
 
         let mvhashmap_construction_time = timer.elapsed();
@@ -287,7 +287,7 @@ where
                         {
                             // There is a txn to be validated
                             validation_counter.fetch_add(1, Ordering::Relaxed);
-                            
+
                             let state_view = MVHashMapView {
                                 map: &versioned_data_cache,
                                 version: version_to_validate,
@@ -328,7 +328,7 @@ where
                                 // to enable successfully executing/validating subsequent txns.
                                 version_to_execute = Some(version_to_validate);
 
-                                re_execution_counter.fetch_add(1, Ordering::Relaxed);
+                                abort_counter.fetch_add(1, Ordering::Relaxed);
                             }
 
                             last_validator_no_work = scheduler.finish_validation();
@@ -562,9 +562,14 @@ where
             delay_execution_counter.load(Ordering::Relaxed)
         );
         println!(
-            "Number of re-executions: {}",
-            re_execution_counter.load(Ordering::Relaxed)
+            "Number of aborts: {}",
+            abort_counter.load(Ordering::Relaxed)
         );
+        println!(
+            "Number of validations: {}",
+            validation_counter.load(Ordering::Relaxed)
+        );
+
 
         let ((s_max, s_avg), (d_max, d_avg)) = versioned_data_cache.get_depth();
         println!("Static mvhashmap: max depth {}, avg depth {}", s_max, s_avg);
