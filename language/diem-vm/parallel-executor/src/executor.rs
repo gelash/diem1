@@ -217,7 +217,8 @@ where
         let scheduler = Scheduler::new(num_txns);
 
         let delay_execution_counter = AtomicUsize::new(0);
-        let revalidation_counter = AtomicUsize::new(0);
+        let re_execution_counter = AtomicUsize::new(0);
+        let validation_counter = AtomicUsize::new(0);
 
         let mvhashmap_construction_time = timer.elapsed();
         timer = Instant::now();
@@ -285,7 +286,8 @@ where
                             scheduler.next_txn_to_validate()
                         {
                             // There is a txn to be validated
-
+                            validation_counter.fetch_add(1, Ordering::Relaxed);
+                            
                             let state_view = MVHashMapView {
                                 map: &versioned_data_cache,
                                 version: version_to_validate,
@@ -326,7 +328,7 @@ where
                                 // to enable successfully executing/validating subsequent txns.
                                 version_to_execute = Some(version_to_validate);
 
-                                revalidation_counter.fetch_add(1, Ordering::Relaxed);
+                                re_execution_counter.fetch_add(1, Ordering::Relaxed);
                             }
 
                             last_validator_no_work = scheduler.finish_validation();
@@ -350,6 +352,7 @@ where
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
+                            //sasha: Daniel, why is this counts for local check done time?
                             local_check_done_time += local_timer.elapsed();
                             local_timer = Instant::now();
 
@@ -559,8 +562,8 @@ where
             delay_execution_counter.load(Ordering::Relaxed)
         );
         println!(
-            "Number of re-validation: {}",
-            revalidation_counter.load(Ordering::Relaxed)
+            "Number of re-executions: {}",
+            re_execution_counter.load(Ordering::Relaxed)
         );
 
         let ((s_max, s_avg), (d_max, d_avg)) = versioned_data_cache.get_depth();
