@@ -585,7 +585,6 @@ where
 
         println!("=====PERF=====\n mvhashmap_construction_time {:?}\n execution_loop_time {:?}\n set_output_time {:?}\n remaining_time {:?}\n\n total_time {:?}\n", mvhashmap_construction_time, execution_loop_time, set_output_time, remaining_time, total_time);
         println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n check_done_time {:?}\n get_txn_to_exe_time {:?}\n nothing_to_exe_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time.lock().unwrap(), apply_write_time.lock().unwrap(), checking_time.lock().unwrap(), validation_time.lock().unwrap(), validation_read_time.lock().unwrap(), validation_write_time.lock().unwrap(), check_done_time.lock().unwrap(), get_txn_to_exe_time.lock().unwrap(), nothing_to_exe_time.lock().unwrap(), execution_time_vec.lock().unwrap(), loop_time_vec.lock().unwrap());
-        println!("cpu num = {}", self.num_cpus);
         // scheduler.print_info();
 
         ret

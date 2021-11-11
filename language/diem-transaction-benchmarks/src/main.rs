@@ -15,6 +15,7 @@ fn main() {
     for block_size in txns {
         for num_accounts in acts {
             for write_rate in writes {
+                print!("prepreing bencher for: block_soze = {}, num_account = {}, write_rate = {}", block_size, num_accounts, write_rate);
                 let mut times = bencher.manual_parallel(num_accounts, block_size, write_rate);
                 times.sort();
                 measurements.push(times);
