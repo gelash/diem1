@@ -110,8 +110,10 @@ where
             );
 
             if i < 3 {
+                println!("warmup - ignore reults");
                 state.execute();
             } else {
+                print!("Preparing bencher for: block_soze = {}, num_account = {}, write_rate = {}", num_txn, num_accounts, write_keep_rate);
                 ret.push(state.execute());
             }
         }
