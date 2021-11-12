@@ -1,3 +1,4 @@
+use std::cmp::min;
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
@@ -190,21 +191,15 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Return the next txn version & status for the thread to validate.
     pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
         // Read val_marker, seq cst ordered for status reads (here below).
-        let mut val_marker = self.validation_marker.load(Ordering::Acquire);
+        let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
 
         loop {
             let next_to_val = (val_marker >> 32) as usize;
-            if next_to_val >= self.num_txn_to_execute() {
+            //if next_to_val >= self.num_txn_to_execute() {
+            if next_to_val >= min(self.num_txn_to_execute(), self.execution_marker.load(Ordering::Relaxed)){
                 return None;
             }
 
-            // Read a seq consistent exec_id watermark and only validate a status with
-            // a matching exec_id.
-            let exec_id_watermark = self.exec_id(next_to_val);
-            if (exec_id_watermark & 1) == 0 {
-                // Even watermark means awating (re-)execution, not ready to validate.
-                return None;
-            }
 
             let num_decrease = val_marker & MASK;
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
@@ -220,12 +215,27 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 Ordering::SeqCst, // Re-read w. seqcst semantics
             ) {
                 Ok(_) => {
-                    // Could assert that status retry number isn't lower than watermark
 
+                    // Read a seq consistent exec_id watermark and only validate a status with
+                    // a matching exec_id.
+                    let exec_id_watermark = self.exec_id(next_to_val);
+                    if (exec_id_watermark & 1) == 0 {
+                        // Even watermark means awating (re-)execution, not ready to validate.
+                        if self.finish_validation() {
+                            self.check_done();
+                        }
+                        return None;
+                    }
+                    // Could assert that status retry number isn't lower than watermark
+                    let test = self.txn_status[next_to_val].load_full().unwrap().clone();
+                    if test.exec_id < exec_id_watermark{
+                        panic!("less than watermark");
+                    }
                     // CAS successful, return index & status.
                     return Some((
                         next_to_val,
-                        self.txn_status[next_to_val].load_full().unwrap().clone(),
+                        //self.txn_status[next_to_val].load_full().unwrap().clone(),
+                        test,
                     ));
                 }
                 Err(x) => {
@@ -319,6 +329,9 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         for dep in version_deps {
             self.txn_buffer.push(dep);
         }
+
+        self.decrease_validation_marker(version);
+
     }
 
     // Returns true if there are no active validators left.
