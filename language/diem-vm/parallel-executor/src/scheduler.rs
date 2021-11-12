@@ -244,6 +244,9 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Return Some(id) if found the next transaction, else return None.
     pub fn next_txn_to_execute(&self) -> Option<Version> {
         // Fetch txn from txn_buffer
+        if self.txn_buffer.is_empty(){
+            return None;
+        }
         match self.txn_buffer.pop() {
             Some(version) => Some(version),
             None => {
