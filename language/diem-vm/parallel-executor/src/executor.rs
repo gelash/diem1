@@ -11,18 +11,10 @@ use anyhow::{bail, Result as AResult};
 use mvhashmap::{MVHashMap, Version};
 use num_cpus;
 use rayon::{prelude::*, scope};
-use std::{
-    cmp::{max, min},
-    collections::HashSet,
-    hash::Hash,
-    hint,
-    marker::PhantomData,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
-};
+use std::{cmp::{max, min}, collections::HashSet, hash::Hash, hint, marker::PhantomData, sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+}, thread, time::{Duration, Instant}, time};
 
 pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
@@ -353,7 +345,8 @@ where
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
-
+                            let ten_millis = time::Duration::from_millis(1);
+                            thread::sleep(ten_millis);
 
                             local_nothing_to_exe_time += local_timer.elapsed();
                             local_timer = Instant::now();
