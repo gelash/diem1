@@ -235,8 +235,8 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
             // let compute_cpus = min(num_txns / max(max_dependency_level, 1), compute_cpus); // Ensure we do not higher rate of conflict than concurrency.
             // let compute_cpus = 7;
 
-            //let compute_cpus = self.num_cpus;
-              let compute_cpus = 16;
+            let compute_cpus = self.num_cpus;
+
             println!(
                 "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}",
                 compute_cpus,
@@ -285,7 +285,7 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                         // First check if any txn can be validated
 
-                        if id < 4 {
+                        if (id & 3) == 0 {
                             if let Some((version_to_validate, status_to_validate)) =
                             scheduler.next_txn_to_validate()
                             {
