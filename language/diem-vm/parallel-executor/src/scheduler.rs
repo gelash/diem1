@@ -245,26 +245,26 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     pub fn next_txn_to_execute(&self) -> Option<Version> {
         // Fetch txn from txn_buffer
         if self.txn_buffer.is_empty(){
-            return None;
-        }
-        match self.txn_buffer.pop() {
-            Some(version) => Some(version),
-            None => {
-                // Fetch the first non-executed txn from the original transaction list
+            // Fetch the first non-executed txn from the original transaction list
 
-                if self.execution_marker_done.load(Ordering::Relaxed) == 1{
-                    return None;
-                }
-
-                let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
-                if next_to_execute < self.num_txn_to_execute() {
-                    Some(next_to_execute)
-                } else {
-                    // Everything executed at least once - validation will take care of rest.
-                    self.execution_marker_done.store(1, Ordering::Relaxed);
-                    None
-                }
+            if self.execution_marker_done.load(Ordering::Relaxed) == 1{
+                return None;
             }
+
+            let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
+            if next_to_execute < self.num_txn_to_execute() {
+                Some(next_to_execute)
+            } else {
+                // Everything executed at least once - validation will take care of rest.
+                self.execution_marker_done.store(1, Ordering::Relaxed);
+                None
+            }
+        }
+        else if let Some(version) =  self.txn_buffer.pop(){
+            Some(version)
+        }
+        else {
+            None
         }
     }
 
