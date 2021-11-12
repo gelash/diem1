@@ -345,8 +345,8 @@ where
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
-                            let ten_millis = time::Duration::from_millis(1);
-                            thread::sleep(ten_millis);
+                            // let ten_millis = time::Duration::from_millis(1);
+                            // thread::sleep(ten_millis);
 
                             local_nothing_to_exe_time += local_timer.elapsed();
                             local_timer = Instant::now();

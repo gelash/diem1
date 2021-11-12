@@ -101,6 +101,8 @@ pub struct Scheduler<K, T, E> {
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
 
+    execution_marker_done: AtomicUsize,
+
     // Shared number of txns to execute: updated before executing a block or when an error or
     // reconfiguration leads to early stopping (at that transaction version).
     stop_at_version: AtomicUsize,
@@ -120,6 +122,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             validation_marker: AtomicU64::new(0),
             num_validating: AtomicUsize::new(0),
             done_marker: AtomicUsize::new(0),
+            execution_marker_done: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
             txn_buffer: SegQueue::new(),
             txn_dependency: (0..num_txns)
@@ -245,11 +248,17 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             Some(version) => Some(version),
             None => {
                 // Fetch the first non-executed txn from the original transaction list
+
+                if self.execution_marker_done.load(Ordering::Relaxed) == 1{
+                    return None;
+                }
+
                 let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
                 if next_to_execute < self.num_txn_to_execute() {
                     Some(next_to_execute)
                 } else {
                     // Everything executed at least once - validation will take care of rest.
+                    self.execution_marker_done.store(1, Ordering::Relaxed);
                     None
                 }
             }
