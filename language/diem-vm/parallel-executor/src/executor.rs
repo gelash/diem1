@@ -271,6 +271,8 @@ where
                             // Thread was just last to validate and had nothing to
                             // execute: check if execution is done.
                             scheduler.check_done();
+                            local_check_done_time += local_timer.elapsed();
+                            local_timer = Instant::now();
                         }
 
                         if scheduler.done() {
@@ -346,14 +348,14 @@ where
 
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
-                            local_nothing_to_exe_time += local_timer.elapsed();
-                            local_timer = Instant::now();
+
 
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
-                            //sasha: Daniel, why is this counts for local check done time?
-                            local_check_done_time += local_timer.elapsed();
+
+
+                            local_nothing_to_exe_time += local_timer.elapsed();
                             local_timer = Instant::now();
 
                             // Nothing to execute, continue to the work loop.

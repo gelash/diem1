@@ -187,7 +187,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Return the next txn version & status for the thread to validate.
     pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
         // Read val_marker, seq cst ordered for status reads (here below).
-        let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
+        let mut val_marker = self.validation_marker.load(Ordering::Acquire);
 
         loop {
             let next_to_val = (val_marker >> 32) as usize;
