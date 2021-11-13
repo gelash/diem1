@@ -269,6 +269,62 @@ where
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
+                    let mut validate = || -> Option<usize> {
+                        let mut ret = None;
+
+                        if let Some((version_to_validate, status_to_validate)) =
+                            scheduler.next_txn_to_validate()
+                        {
+                            // There is a txn to be validated
+                            validation_counter.fetch_add(1, Ordering::Relaxed);
+
+                            let state_view = MVHashMapView {
+                                map: &versioned_data_cache,
+                                version: version_to_validate,
+                                scheduler: &scheduler,
+                                read_dependency: AtomicBool::new(false),
+                                reads: Arc::new(Mutex::new(Vec::new())),
+                            };
+
+                            let read_timer = Instant::now();
+                            // If dynamic mv data-structure hasn't been written to, it's safe
+                            // to skip validation - it is going to succeed (in order to be
+                            // validating, all prior txn's must have been executed already).
+                            let valid = versioned_data_cache.dynamic_empty()
+                                || status_to_validate.read_set().iter().all(|r| {
+                                    r.validate(state_view.read_version_and_exec_id(r.path()))
+                                });
+                            local_validation_read_time += read_timer.elapsed();
+
+                            // let mut aborted = false;
+                            if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
+                                // Not valid && successfully aborted.
+
+                                // Set dirty in both static and dynamic mvhashmaps.
+                                let write_timer = Instant::now();
+                                state_view.mark_dirty(
+                                    version_to_validate,
+                                    status_to_validate.exec_id(),
+                                    &infer_result[version_to_validate]
+                                        .keys_written
+                                        .iter()
+                                        .cloned()
+                                        .collect(),
+                                    &status_to_validate.write_set(),
+                                );
+                                local_validation_write_time += write_timer.elapsed();
+
+                                ret =
+                                    scheduler.schedule_txn(version_to_validate, self.num_cpus / 4);
+
+                                abort_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            scheduler.finish_validation();
+                        }
+                        ret
+                    };
+
                     loop {
                         if scheduler.done() {
                             // The work is done, break from the loop.
@@ -278,67 +334,15 @@ where
                         let mut version_to_execute = None;
 
                         // First check if any txn can be validated
-
                         if (id & 7) == 0 {
-                            if let Some((version_to_validate, status_to_validate)) =
-                                scheduler.next_txn_to_validate()
-                            {
-                                // There is a txn to be validated
-                                validation_counter.fetch_add(1, Ordering::Relaxed);
+                            version_to_execute = validate();
+                            local_validation_time += local_timer.elapsed();
+                            local_timer = Instant::now();
 
-                                let state_view = MVHashMapView {
-                                    map: &versioned_data_cache,
-                                    version: version_to_validate,
-                                    scheduler: &scheduler,
-                                    read_dependency: AtomicBool::new(false),
-                                    reads: Arc::new(Mutex::new(Vec::new())),
-                                };
-
-                                let read_timer = Instant::now();
-                                // If dynamic mv data-structure hasn't been written to, it's safe
-                                // to skip validation - it is going to succeed (in order to be
-                                // validating, all prior txn's must have been executed already).
-                                let valid = versioned_data_cache.dynamic_empty()
-                                    || status_to_validate.read_set().iter().all(|r| {
-                                        r.validate(state_view.read_version_and_exec_id(r.path()))
-                                    });
-                                local_validation_read_time += read_timer.elapsed();
-
-                                // let mut aborted = false;
-                                if !valid
-                                    && scheduler.abort(version_to_validate, &status_to_validate)
-                                {
-                                    // Not valid && successfully aborted.
-
-                                    // Set dirty in both static and dynamic mvhashmaps.
-                                    let write_timer = Instant::now();
-                                    state_view.mark_dirty(
-                                        version_to_validate,
-                                        status_to_validate.exec_id(),
-                                        &infer_result[version_to_validate]
-                                            .keys_written
-                                            .iter()
-                                            .cloned()
-                                            .collect(),
-                                        &status_to_validate.write_set(),
-                                    );
-                                    local_validation_write_time += write_timer.elapsed();
-
-                                    version_to_execute = scheduler
-                                        .schedule_txn(version_to_validate, self.num_cpus / 4);
-
-                                    abort_counter.fetch_add(1, Ordering::Relaxed);
-                                }
-
-                                scheduler.finish_validation();
-                                local_validation_time += local_timer.elapsed();
-                                local_timer = Instant::now();
-
-                                if version_to_execute.is_none() {
-                                    // Validation successfully completed or someone already aborted,
-                                    // continue to the work loop.
-                                    continue;
-                                }
+                            if version_to_execute.is_none() {
+                                // Validation successfully completed or someone already aborted,
+                                // continue to the work loop.
+                                continue;
                             }
                         }
 
