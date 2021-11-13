@@ -4,8 +4,7 @@
 use crate::{
     executor::ParallelTransactionExecutor,
     proptest_types::types::{
-        ExpectedOutput, Inferencer, STMInferencer, Task, Transaction, TransactionGen,
-        TransactionGenParams,
+        ExpectedOutput, STMInferencer, Task, Transaction, TransactionGen, TransactionGenParams,
     },
 };
 use criterion::{BatchSize, Bencher as CBencher};

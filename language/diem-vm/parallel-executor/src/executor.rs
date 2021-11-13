@@ -21,7 +21,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    thread, time,
     time::{Duration, Instant},
 };
 
@@ -97,10 +96,16 @@ impl<
         version: Version,
         exec_id: usize,
         data: Option<V>,
-        estimated_writes: &HashSet<&K>,
+        original_estimates: &HashSet<K>,
+        prev_writes: &mut HashSet<K>,
+        writes_outside: &mut bool,
     ) -> Result<(), Error<E>> {
+        if !prev_writes.remove(k) {
+            *writes_outside = true;
+        }
+
         // Write estimated writes to static mvhashmap, and write non-estimated ones to dynamic mvhashmap
-        if estimated_writes.contains(k) {
+        if original_estimates.contains(k) {
             self.map.write_to_static(k, version, exec_id, data).unwrap();
         } else {
             self.map
@@ -109,19 +114,29 @@ impl<
         }
         Ok(())
     }
-    //bla
+
     pub fn mark_dirty(
         &self,
         version: usize,
         exec_id: usize,
-        estimated_writes: &Vec<K>,
+        original_estimates: &HashSet<K>,
         actual_writes: &Vec<(K, V)>,
     ) {
         for (k, _) in actual_writes {
-            if !estimated_writes.contains(k) {
-                self.map.set_dirty_to_dynamic(k, version, exec_id).unwrap();
+            if !original_estimates.contains(k) {
+                self.map.set_dirty_to_dynamic(k, version, exec_id);
             } else {
                 self.map.set_dirty_to_static(k, version, exec_id).unwrap();
+            }
+        }
+    }
+
+    pub fn skip(&self, version: usize, skipped_writes: HashSet<K>, original_estimates: HashSet<K>) {
+        for k in skipped_writes.iter() {
+            if !original_estimates.contains(k) {
+                self.map.skip_dynamic(k, version);
+            } else {
+                self.map.skip_static(k, version).unwrap();
             }
         }
     }
@@ -173,20 +188,6 @@ where
         // let timer1 = Instant::now();
         // Get the read and write dependency for each transaction.
         let infer_result = self.inferencer.result(&signature_verified_block);
-        // Vec<_> = {
-        //     match signature_verified_block
-        //         .par_iter()
-        //         .with_min_len(chunks_size)
-        //         .map(|txn| self.inferencer.infer_reads_writes(txn))
-        //         .collect::<AResult<Vec<_>>>()
-        //     {
-        //         Ok(res) => res,
-        //         // Inferencer passed in by user failed to get the read/writeset of a transaction,
-        //         // abort parallel execution.
-        //         Err(_) => return Err(Error::InferencerError),
-        //     }
-        // };
-        // println!("Inferencer Call {:?}", timer1.elapsed());
 
         // Use write analysis result to construct placeholders.
         let path_version_tuples: Vec<(T::Key, usize)> = infer_result
@@ -269,59 +270,56 @@ where
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
-                    let mut validate = || -> Option<usize> {
+                    let mut validate = |version_to_validate: usize, o: bool| -> Option<usize> {
+                        let status_to_validate = scheduler.status(version_to_validate);
                         let mut ret = None;
 
-                        if let Some((version_to_validate, status_to_validate)) =
-                            scheduler.next_txn_to_validate()
-                        {
-                            // There is a txn to be validated
-                            validation_counter.fetch_add(1, Ordering::Relaxed);
+                        // There is a txn to be validated
+                        validation_counter.fetch_add(1, Ordering::Relaxed);
 
-                            let state_view = MVHashMapView {
-                                map: &versioned_data_cache,
-                                version: version_to_validate,
-                                scheduler: &scheduler,
-                                read_dependency: AtomicBool::new(false),
-                                reads: Arc::new(Mutex::new(Vec::new())),
-                            };
+                        let state_view = MVHashMapView {
+                            map: &versioned_data_cache,
+                            version: version_to_validate,
+                            scheduler: &scheduler,
+                            read_dependency: AtomicBool::new(false),
+                            reads: Arc::new(Mutex::new(Vec::new())),
+                        };
 
-                            let read_timer = Instant::now();
-                            // If dynamic mv data-structure hasn't been written to, it's safe
-                            // to skip validation - it is going to succeed (in order to be
-                            // validating, all prior txn's must have been executed already).
-                            let valid = versioned_data_cache.dynamic_empty()
-                                || status_to_validate.read_set().iter().all(|r| {
-                                    r.validate(state_view.read_version_and_exec_id(r.path()))
-                                });
-                            local_validation_read_time += read_timer.elapsed();
+                        let read_timer = Instant::now();
+                        // If dynamic mv data-structure hasn't been written to, it's safe
+                        // to skip validation - it is going to succeed (in order to be
+                        // validating, all prior txn's must have been executed already).
+                        let valid = versioned_data_cache.dynamic_empty()
+                            || status_to_validate
+                                .read_set()
+                                .iter()
+                                .all(|r| r.validate(state_view.read_version_and_exec_id(r.path())));
+                        local_validation_read_time += read_timer.elapsed();
 
-                            // let mut aborted = false;
-                            if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
-                                // Not valid && successfully aborted.
+                        if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
+                            // Not valid && successfully aborted.
 
-                                // Set dirty in both static and dynamic mvhashmaps.
-                                let write_timer = Instant::now();
-                                state_view.mark_dirty(
-                                    version_to_validate,
-                                    status_to_validate.exec_id(),
-                                    &infer_result[version_to_validate]
-                                        .keys_written
-                                        .iter()
-                                        .cloned()
-                                        .collect(),
-                                    &status_to_validate.write_set(),
-                                );
-                                local_validation_write_time += write_timer.elapsed();
+                            // Set dirty in both static and dynamic mvhashmaps.
+                            let write_timer = Instant::now();
+                            state_view.mark_dirty(
+                                version_to_validate,
+                                status_to_validate.exec_id(),
+                                &infer_result[version_to_validate]
+                                    .keys_written
+                                    .iter()
+                                    .cloned()
+                                    .collect(),
+                                &status_to_validate.write_set(),
+                            );
+                            local_validation_write_time += write_timer.elapsed();
 
-                                ret =
-                                    scheduler.schedule_txn(version_to_validate, self.num_cpus / 4);
+                            ret = scheduler.schedule_txn(version_to_validate, self.num_cpus / 4, o);
 
-                                abort_counter.fetch_add(1, Ordering::Relaxed);
-                            }
-
-                            scheduler.finish_validation();
+                            abort_counter.fetch_add(1, Ordering::Relaxed);
                         }
+
+                        scheduler.finish_validation();
+
                         ret
                     };
 
@@ -334,10 +332,12 @@ where
                         let mut version_to_execute = None;
 
                         // First check if any txn can be validated
-                        if (id & 7) == 0 {
-                            version_to_execute = validate();
-                            local_validation_time += local_timer.elapsed();
-                            local_timer = Instant::now();
+                        if (id & 3) == 0 {
+                            if let Some(version_to_validate) = scheduler.next_txn_to_validate() {
+                                version_to_execute = validate(version_to_validate, false);
+                                local_validation_time += local_timer.elapsed();
+                                local_timer = Instant::now();
+                            }
 
                             if version_to_execute.is_none() {
                                 // Validation successfully completed or someone already aborted,
@@ -381,7 +381,8 @@ where
 
                         // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
                         if txn_accesses.keys_read.iter().any(|k| {
-                            match versioned_data_cache.read_from_static(k, txn_to_execute) {
+                            // match versioned_data_cache.read_from_static(k, txn_to_execute) {
+                            match versioned_data_cache.read(k, txn_to_execute) {
                                 Err(Some((dep_id, _))) => {
                                     scheduler.add_dependency(txn_to_execute, dep_id)
                                 }
@@ -411,11 +412,28 @@ where
                             continue;
                         }
 
+                        let original_estimates: HashSet<T::Key> =
+                            txn_accesses.keys_written.iter().cloned().collect();
+
                         let exec_id = scheduler.exec_id(txn_to_execute);
-                        let mut estimated_writes = HashSet::new();
-                        for write in txn_accesses.keys_written.iter() {
-                            estimated_writes.insert(write);
+                        if exec_id & 2 == 1 {
+                            panic!("executed status while executing");
                         }
+                        let mut prev_write_set: HashSet<T::Key> = if exec_id == 0 {
+                            original_estimates.clone()
+                        } else {
+                            scheduler
+                                .status(txn_to_execute)
+                                .write_set()
+                                .iter()
+                                .map(|(k, _)| k.clone())
+                                .collect()
+                        };
+                        // prev write set has already been marked dirty! similarly,
+                        // the estimates are marked as Unassigned. So future transactions
+                        // only need revalidation when there is a write outside of the
+                        // prev_write_set.
+                        let mut writes_outside = false;
 
                         let commit_result = match execute_result {
                             ExecutionStatus::Success(output) => {
@@ -427,7 +445,9 @@ where
                                             txn_to_execute,
                                             exec_id,
                                             Some(v),
-                                            &estimated_writes,
+                                            &original_estimates,
+                                            &mut prev_write_set,
+                                            &mut writes_outside,
                                         )
                                         .is_ok()
                                 }) {
@@ -448,7 +468,9 @@ where
                                             txn_to_execute,
                                             exec_id,
                                             Some(v),
-                                            &estimated_writes,
+                                            &original_estimates,
+                                            &mut prev_write_set,
+                                            &mut writes_outside,
                                         )
                                         .is_ok()
                                 }) {
@@ -468,22 +490,25 @@ where
                             }
                         };
 
-                        for write in txn_accesses.keys_written.iter() {
-                            // Unwrap here is fine because all writes here should be in the mvhashmap.
-                            assert!(versioned_data_cache
-                                .skip_if_not_set(write, txn_to_execute, exec_id)
-                                .is_ok());
-                        }
+                        state_view.skip(txn_to_execute, prev_write_set, original_estimates);
 
                         scheduler.finish_execution(
                             txn_to_execute,
                             exec_id,
                             state_view.drain_reads(),
                             commit_result,
+                            writes_outside,
                         );
-
                         local_apply_write_time += local_timer.elapsed();
                         local_timer = Instant::now();
+
+                        if !writes_outside {
+                            if validate(txn_to_execute, true).is_some() {
+                                panic!("didn't schedule");
+                            }
+                            local_validation_time += local_timer.elapsed();
+                            local_timer = Instant::now();
+                        }
                     }
 
                     let mut execution = execution_time.lock().unwrap();

@@ -71,8 +71,13 @@ impl<V> WriteCell<V> {
         self.flag.store(FLAG_DONE, Ordering::SeqCst);
     }
 
-    pub fn skip(&self, retry_num: usize) {
-        self.retry_num.store(retry_num, Ordering::SeqCst);
+    pub fn skip(&self) {
+        // TODO: remove, for debugging purposes.
+        // let prev = self.flag.load(Ordering::SeqCst);
+        // if prev == FLAG_SKIP || prev == FLAG_DONE {
+        // panic!();
+        // }
+
         self.flag.store(FLAG_SKIP, Ordering::SeqCst);
     }
 }
@@ -193,12 +198,7 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap
         self.s_mvhashmap.set_dirty(key, version, retry_num)
     }
 
-    pub fn set_dirty_to_dynamic(
-        &self,
-        key: &K,
-        version: Version,
-        retry_num: usize,
-    ) -> Result<(), ()> {
+    pub fn set_dirty_to_dynamic(&self, key: &K, version: Version, retry_num: usize) {
         self.d_mvhashmap.set_dirty(key, version, retry_num)
     }
 
@@ -206,17 +206,12 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap
         self.d_mvhashmap.empty()
     }
 
-    pub fn skip(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
-        self.s_mvhashmap.skip(key, version, retry_num)
+    pub fn skip_static(&self, key: &K, version: Version) -> Result<(), Error> {
+        self.s_mvhashmap.skip(key, version)
     }
 
-    pub fn skip_if_not_set(
-        &self,
-        key: &K,
-        version: Version,
-        retry_num: usize,
-    ) -> Result<(), Error> {
-        self.s_mvhashmap.skip_if_not_set(key, version, retry_num)
+    pub fn skip_dynamic(&self, key: &K, version: Version) {
+        self.d_mvhashmap.skip(key, version)
     }
 
     // returns (max depth, avg depth) of dynamic hashmap
@@ -280,34 +275,13 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         Ok(())
     }
 
-    /// Skips writing to `key` at `version` if that entry hasn't been assigned.
-    /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn skip_if_not_set(
-        &self,
-        key: &K,
-        version: Version,
-        retry_num: usize,
-    ) -> Result<(), Error> {
-        // We only write or skip once per entry
-        // So it is safe to go ahead and just do it.
-        let entry = self.get_entry(key, version)?;
-
-        let flag = entry.flag.load(Ordering::SeqCst);
-        let retry = entry.retry_num.load(Ordering::SeqCst);
-        if (retry < retry_num) || (retry == retry_num && flag != FLAG_DONE) {
-            entry.skip(retry_num);
-        }
-
-        Ok(())
-    }
-
     /// Skips writing to `key` at `version`.
     /// Function will return an error if the write is not in the initial `possible_writes` list.
     /// `skip` should only be invoked when `key` at `version` hasn't been assigned.
-    pub fn skip(&self, key: &K, version: Version, retry_num: usize) -> Result<(), Error> {
+    pub fn skip(&self, key: &K, version: Version) -> Result<(), Error> {
         let entry = self.get_entry(key, version)?;
 
-        entry.skip(retry_num);
+        entry.skip();
         Ok(())
     }
 
@@ -444,12 +418,19 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
         Ok(())
     }
 
-    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) -> Result<(), ()> {
+    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) {
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        // TODO: just update the entry.
-        map.insert(version, WriteCell::new_from(FLAG_DIRTY, retry_num, None));
 
-        Ok(())
+        // TODO: just update the entry. Later even with shortcut (and no need for wlock).
+        map.insert(version, WriteCell::new_from(FLAG_DIRTY, retry_num, None));
+    }
+
+    pub fn skip(&self, key: &K, version: Version) {
+        let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
+
+        //TODO: update - logical skip. Later even with shortcut (and no need for wlock).
+        // Make sure map traversal handles it.
+        map.remove(&version);
     }
 
     // read when using Btree, may return Ok((Option<V>, Version, retry_num)), Err(Some(Version)) or Err(None)
@@ -466,24 +447,27 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
                 // Find the dependency
                 let mut iter = tree.range(0..version);
                 while let Some((entry_key, entry_val)) = iter.next_back() {
-                    if *entry_key < version {
-                        let flag = entry_val.flag.load(Ordering::SeqCst);
+                    // if *entry_key < version {
+                    let flag = entry_val.flag.load(Ordering::SeqCst);
 
-                        if flag == FLAG_DIRTY {
-                            continue;
-                        }
-
-                        // The entry is populated so return its contents
-                        if flag == FLAG_DONE {
-                            return Ok((
-                                (**entry_val.data.load()).clone(),
-                                *entry_key,
-                                entry_val.retry_num.load(Ordering::SeqCst),
-                            ));
-                        }
-
-                        unreachable!();
+                    if flag == FLAG_DIRTY {
+                        return Err(Some((
+                            *entry_key,
+                            entry_val.retry_num.load(Ordering::SeqCst),
+                        )));
                     }
+
+                    // The entry is populated so return its contents
+                    if flag == FLAG_DONE {
+                        return Ok((
+                            (**entry_val.data.load()).clone(),
+                            *entry_key,
+                            entry_val.retry_num.load(Ordering::SeqCst),
+                        ));
+                    }
+
+                    unreachable!();
+                    // }
                 }
                 return Err(None);
             }

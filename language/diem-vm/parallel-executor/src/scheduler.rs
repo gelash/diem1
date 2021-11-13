@@ -97,8 +97,7 @@ pub struct Scheduler<K, T, E> {
     // Stores number of threads that are currently validating. Used in combination with validation
     // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
     // counter would generalize to detect what prefix can be committed.
-    num_validating: AtomicUsize,
-    num_executing: AtomicUsize,
+    num_active_tasks: AtomicUsize,
     // Shared marker that's set when a thread detects all txns can be committed - so
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
@@ -122,8 +121,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         Self {
             execution_marker: AtomicUsize::new(0),
             validation_marker: AtomicU64::new(0),
-            num_validating: AtomicUsize::new(0),
-            num_executing: AtomicUsize::new(0),
+            num_active_tasks: AtomicUsize::new(0),
             done_marker: AtomicUsize::new(0),
             execution_marker_done: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
@@ -191,7 +189,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     // Return the next txn version & status for the thread to validate.
-    pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
+    pub fn next_txn_to_validate(&self) -> Option<usize> {
         // Read val_marker, seq cst ordered for check_done.
         let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
 
@@ -207,7 +205,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
 
             // Mark that thread is validating next_to_val, else early abort possible.
-            self.num_validating.fetch_add(1, Ordering::SeqCst);
+            self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
 
             // CAS to win the competition to actually validate next_to_val.
             match self.validation_marker.compare_exchange_weak(
@@ -222,28 +220,24 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                     let exec_id_watermark = self.exec_id(next_to_val);
                     if (exec_id_watermark & 1) == 0 {
                         // Even watermark means awating (re-)execution, not ready to validate.
-                        self.num_validating.fetch_sub(1, Ordering::SeqCst);
+                        self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
                         return None;
                     }
-                    // Could assert that status retry number isn't lower than watermark
-                    let test = self.txn_status[next_to_val].load_full().unwrap().clone();
-                    if test.exec_id < exec_id_watermark {
-                        panic!("less than watermark");
-                    }
+
                     // CAS successful, return index & status.
-                    return Some((
-                        next_to_val,
-                        //self.txn_status[next_to_val].load_full().unwrap().clone(),
-                        test,
-                    ));
+                    return Some(next_to_val);
                 }
                 Err(x) => {
                     // CAS unsuccessful - not validating next_to_val (will try different index).
-                    self.num_validating.fetch_sub(1, Ordering::SeqCst);
+                    self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
                     val_marker = x;
                 }
             }
         }
+    }
+
+    pub fn status(&self, version: usize) -> Arc<STMStatus<K, T, E>> {
+        self.txn_status[version].load_full().unwrap().clone()
     }
 
     // Return the next txn id for the thread to execute: first fetch from the shared queue that
@@ -258,13 +252,15 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 return None;
             }
 
+            self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
             let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
             if next_to_execute < self.num_txn_to_execute() {
-                self.num_executing.fetch_add(1, Ordering::SeqCst);
                 Some(next_to_execute)
             } else {
                 // Everything executed at least once - validation will take care of rest.
                 self.execution_marker_done.store(1, Ordering::Relaxed);
+
+                self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
                 None
             }
         } else if let Some(version) = self.txn_buffer.pop() {
@@ -305,6 +301,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         exec_id: usize,
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
+        revalidate_suffix: bool,
     ) {
         // Stores are safe because there is at most one execution at a time.
         self.txn_status[version].store(Some(Arc::new(STMStatus {
@@ -326,19 +323,26 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             self.txn_buffer.push(dep);
         }
 
-        self.decrease_validation_marker(version);
-        self.num_executing.fetch_sub(1, Ordering::SeqCst);
+        if revalidate_suffix {
+            self.decrease_validation_marker(version);
+            self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     // Returns true if there are no active validators left.
     pub fn finish_validation(&self) {
-        self.num_validating.fetch_sub(1, Ordering::SeqCst);
+        self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub fn schedule_txn(&self, version: usize, buffer_threshold: usize) -> Option<usize> {
-        self.num_executing.fetch_add(1, Ordering::SeqCst);
+    pub fn schedule_txn(
+        &self,
+        version: usize,
+        buffer_threshold: usize,
+        share_override: bool,
+    ) -> Option<usize> {
+        self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
 
-        if self.txn_buffer.len() > buffer_threshold {
+        if !share_override && self.txn_buffer.len() > buffer_threshold {
             Some(version)
         } else {
             self.txn_buffer.push(version);
@@ -366,10 +370,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     fn check_done(&self, val_marker: u64, num_txns: usize) {
         let val_version = (val_marker >> 32) as usize;
 
-        if val_version < num_txns
-            || self.num_validating.load(Ordering::SeqCst) > 0
-            || self.num_executing.load(Ordering::SeqCst) > 0
-        {
+        if val_version < num_txns || self.num_active_tasks.load(Ordering::SeqCst) > 0 {
             // There are txns to validate.
             return;
         }
