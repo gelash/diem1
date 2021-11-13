@@ -11,10 +11,19 @@ use anyhow::{bail, Result as AResult};
 use mvhashmap::{MVHashMap, Version};
 use num_cpus;
 use rayon::{prelude::*, scope};
-use std::{cmp::{max, min}, collections::HashSet, hash::Hash, hint, marker::PhantomData, sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
-}, thread, time::{Duration, Instant}, time};
+use std::{
+    cmp::{max, min},
+    collections::HashSet,
+    hash::Hash,
+    hint,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread, time,
+    time::{Duration, Instant},
+};
 
 pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
@@ -25,12 +34,12 @@ pub struct MVHashMapView<'a, K, V, T, E> {
 }
 
 impl<
-    'a,
-    K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Clone + Send + Sync,
-    T: TransactionOutput,
-    E: Send + Clone,
-> MVHashMapView<'a, K, V, T, E>
+        'a,
+        K: PartialOrd + Send + Clone + Hash + Eq,
+        V: Clone + Send + Sync,
+        T: TransactionOutput,
+        E: Send + Clone,
+    > MVHashMapView<'a, K, V, T, E>
 {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
@@ -133,10 +142,10 @@ pub struct ParallelTransactionExecutor<T: Transaction, E: ExecutorTask, I: ReadW
 }
 
 impl<T, E, I> ParallelTransactionExecutor<T, E, I>
-    where
-        T: Transaction,
-        E: ExecutorTask<T=T>,
-        I: ReadWriteSetInferencer<T=T>,
+where
+    T: Transaction,
+    E: ExecutorTask<T = T>,
+    I: ReadWriteSetInferencer<T = T>,
 {
     pub fn new(inferencer: I) -> Self {
         Self {
@@ -244,12 +253,10 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                 scheduler.num_txn_to_execute(),
             );
 
-
             for _ in 0..(compute_cpus) {
                 s.spawn(|_| {
                     // Make a new executor per thread.
                     let id: usize = gen_id.fetch_add(1, Ordering::Relaxed);
-                    let mut aborted = false;
 
                     let task = E::init(task_initial_arguments);
 
@@ -266,7 +273,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                     let mut last_validator_no_work = false;
                     loop {
-                        aborted = false;
                         if last_validator_no_work {
                             // Thread was just last to validate and had nothing to
                             // execute: check if execution is done.
@@ -287,7 +293,7 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                         if (id & 3) == 0 {
                             if let Some((version_to_validate, status_to_validate)) =
-                            scheduler.next_txn_to_validate()
+                                scheduler.next_txn_to_validate()
                             {
                                 // There is a txn to be validated
                                 validation_counter.fetch_add(1, Ordering::Relaxed);
@@ -306,12 +312,14 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                 // validating, all prior txn's must have been executed already).
                                 let valid = versioned_data_cache.dynamic_empty()
                                     || status_to_validate.read_set().iter().all(|r| {
-                                    r.validate(state_view.read_version_and_exec_id(r.path()))
-                                });
+                                        r.validate(state_view.read_version_and_exec_id(r.path()))
+                                    });
                                 local_validation_read_time += read_timer.elapsed();
 
-                                if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
-                                    aborted = true;
+                                // let mut aborted = false;
+                                if !valid
+                                    && scheduler.abort(version_to_validate, &status_to_validate)
+                                {
                                     // Not valid && successfully aborted.
 
                                     // Set dirty in both static and dynamic mvhashmaps.
@@ -328,37 +336,30 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                     );
                                     local_validation_write_time += write_timer.elapsed();
 
-                                    // Thread will immediately re-execute this txn (bypass global scheduling).
-                                    // Avoids overhead, and also aborted txn is high priority to re-execute ASAP
-                                    // to enable successfully executing/validating subsequent txns.
-                                    version_to_execute = Some(version_to_validate);
+                                    // In some cases maybe the thread can help and do itself
+                                    // like before - i.e. set version_to_execute (not from scheduler)
+                                    scheduler.schedule_txn(version_to_validate);
 
+                                    // aborted = true;
                                     abort_counter.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    last_validator_no_work = scheduler.finish_validation();
                                 }
 
-
+                                last_validator_no_work = scheduler.finish_validation();
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
-                                if version_to_execute.is_none() {
-                                    // Validation successfully completed or someone already aborted,
-                                    // continue to the work loop.
-                                    continue;
-                                }
-                            } else {
-                                version_to_execute = scheduler.next_txn_to_execute();
+                                continue;
+                                // if version_to_execute.is_none() {
+                                // Validation successfully completed or someone already aborted,
+                                // continue to the work loop.
+                                // continue;
+                                // }
                             }
-                        } else {
-                            version_to_execute = scheduler.next_txn_to_execute();
                         }
 
-
+                        version_to_execute = scheduler.next_txn_to_execute();
                         // If there is no txn to be committed or validated, get the next txn to execute
                         if version_to_execute.is_none() {
-
-
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
@@ -419,9 +420,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                             // We've already added this transaction back to the scheduler in the
                             // MVHashmapView where this bit is set, thus it is safe to continue
                             // here.
-                            if aborted {
-                                panic!("We are stupid");
-                            }
                             continue;
                         }
 
@@ -495,10 +493,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                             state_view.drain_reads(),
                             commit_result,
                         );
-
-                        if aborted {
-                            last_validator_no_work = scheduler.finish_validation();
-                        }
 
                         local_apply_write_time += local_timer.elapsed();
                         local_timer = Instant::now();
@@ -588,7 +582,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
             "Number of validations: {}",
             validation_counter.load(Ordering::Relaxed)
         );
-
 
         let ((s_max, s_avg), (d_max, d_avg)) = versioned_data_cache.get_depth();
         println!("Static mvhashmap: max depth {}, avg depth {}", s_max, s_avg);
