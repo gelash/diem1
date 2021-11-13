@@ -335,9 +335,15 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         self.num_validating.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub fn schedule_txn(&self, version: usize) {
+    pub fn schedule_txn(&self, version: usize, buffer_threshold: usize) -> Option<usize> {
         self.num_executing.fetch_add(1, Ordering::SeqCst);
-        self.txn_buffer.push(version);
+
+        if self.txn_buffer.len() > buffer_threshold {
+            Some(version)
+        } else {
+            self.txn_buffer.push(version);
+            None
+        }
     }
 
     // Reset the txn version/id to end execution earlier. The executor will stop at the smallest

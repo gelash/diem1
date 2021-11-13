@@ -279,7 +279,7 @@ where
 
                         // First check if any txn can be validated
 
-                        if (id & 3) == 0 {
+                        if (id & 7) == 0 {
                             if let Some((version_to_validate, status_to_validate)) =
                                 scheduler.next_txn_to_validate()
                             {
@@ -324,12 +324,9 @@ where
                                     );
                                     local_validation_write_time += write_timer.elapsed();
 
-                                    // TODO: check segqueue size?
-                                    // In some cases maybe the thread can help and do itself
-                                    // like before - i.e. set version_to_execute (not from scheduler)
-                                    scheduler.schedule_txn(version_to_validate);
+                                    version_to_execute = scheduler
+                                        .schedule_txn(version_to_validate, self.num_cpus / 4);
 
-                                    // aborted = true;
                                     abort_counter.fetch_add(1, Ordering::Relaxed);
                                 }
 
@@ -337,23 +334,22 @@ where
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
-                                continue;
-                                // if version_to_execute.is_none() {
-                                // Validation successfully completed or someone already aborted,
-                                // continue to the work loop.
-                                // continue;
-                                // }
+                                if version_to_execute.is_none() {
+                                    // Validation successfully completed or someone already aborted,
+                                    // continue to the work loop.
+                                    continue;
+                                }
                             }
                         }
 
-                        version_to_execute = scheduler.next_txn_to_execute();
-                        // If there is no txn to be committed or validated, get the next txn to execute
+                        if version_to_execute.is_none() {
+                            version_to_execute = scheduler.next_txn_to_execute();
+                            // If there is no txn to be committed or validated, get the next txn to execute
+                        }
+
                         if version_to_execute.is_none() {
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
-
-                            // let ten_millis = time::Duration::from_millis(1);
-                            // thread::sleep(ten_millis);
 
                             local_nothing_to_exe_time += local_timer.elapsed();
                             local_timer = Instant::now();
@@ -526,7 +522,6 @@ where
         scope(|s| {
             // How many threads to use?
             let compute_cpus = min(1 + (num_txns / 50), self.num_cpus); // Ensure we have at least 50 tx per thread.
-            let compute_cpus = min(num_txns / max(1, max_dependency_level), compute_cpus); // Ensure we do not higher rate of conflict than concurrency.
             for _ in 0..(compute_cpus) {
                 s.spawn(|_| {
                     loop {
