@@ -192,18 +192,14 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
     // Return the next txn version & status for the thread to validate.
     pub fn next_txn_to_validate(&self) -> Option<(usize, Arc<STMStatus<K, T, E>>)> {
-        // Read val_marker, seq cst ordered for status reads (here below).
+        // Read val_marker, seq cst ordered for check_done.
         let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
 
         loop {
             let next_to_val = (val_marker >> 32) as usize;
-            //if next_to_val >= self.num_txn_to_execute() {
-            if next_to_val
-                >= min(
-                    self.num_txn_to_execute(),
-                    self.execution_marker.load(Ordering::Relaxed),
-                )
-            {
+            let num_txns = self.num_txn_to_execute();
+            if next_to_val >= min(num_txns, self.execution_marker.load(Ordering::Relaxed)) {
+                self.check_done(val_marker, num_txns);
                 return None;
             }
 
@@ -226,9 +222,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                     let exec_id_watermark = self.exec_id(next_to_val);
                     if (exec_id_watermark & 1) == 0 {
                         // Even watermark means awating (re-)execution, not ready to validate.
-                        if self.finish_validation() {
-                            self.check_done();
-                        }
+                        self.num_validating.fetch_sub(1, Ordering::SeqCst);
                         return None;
                     }
                     // Could assert that status retry number isn't lower than watermark
@@ -245,9 +239,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 }
                 Err(x) => {
                     // CAS unsuccessful - not validating next_to_val (will try different index).
-                    if self.finish_validation() {
-                        self.check_done();
-                    }
+                    self.num_validating.fetch_sub(1, Ordering::SeqCst);
                     val_marker = x;
                 }
             }
@@ -339,8 +331,8 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     // Returns true if there are no active validators left.
-    pub fn finish_validation(&self) -> bool {
-        self.num_validating.fetch_sub(1, Ordering::SeqCst) == 1
+    pub fn finish_validation(&self) {
+        self.num_validating.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn schedule_txn(&self, version: usize) {
@@ -365,11 +357,9 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Checks validation marker, takes min of validation index (val marker's first 32 bits)
     // and thread commit markers. If >= stop_version, re-reads val marker to ensure it
     // (in particular, gen counter) hasn't changed - otherwise a race is possible.
-    pub fn check_done(&self) {
-        let val_marker = self.validation_marker.load(Ordering::SeqCst);
-
-        let num_txns = self.num_txn_to_execute();
+    fn check_done(&self, val_marker: u64, num_txns: usize) {
         let val_version = (val_marker >> 32) as usize;
+
         if val_version < num_txns
             || self.num_validating.load(Ordering::SeqCst) > 0
             || self.num_executing.load(Ordering::SeqCst) > 0

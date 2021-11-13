@@ -230,7 +230,6 @@ where
         let apply_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let nothing_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let get_txn_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let check_done_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
@@ -265,29 +264,18 @@ where
                     let mut local_apply_write_time = Duration::new(0, 0);
                     let mut local_get_txn_to_exe_time = Duration::new(0, 0);
                     let mut local_nothing_to_exe_time = Duration::new(0, 0);
-                    let mut local_check_done_time = Duration::new(0, 0);
                     let mut local_validation_time = Duration::new(0, 0);
                     let mut local_validation_read_time = Duration::new(0, 0);
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
-                    let mut last_validator_no_work = false;
                     loop {
-                        if last_validator_no_work {
-                            // Thread was just last to validate and had nothing to
-                            // execute: check if execution is done.
-                            scheduler.check_done();
-                            local_check_done_time += local_timer.elapsed();
-                            local_timer = Instant::now();
-                        }
-
                         if scheduler.done() {
                             // The work is done, break from the loop.
                             break;
                         }
 
                         let mut version_to_execute = None;
-                        last_validator_no_work = false;
 
                         // First check if any txn can be validated
 
@@ -336,6 +324,7 @@ where
                                     );
                                     local_validation_write_time += write_timer.elapsed();
 
+                                    // TODO: check segqueue size?
                                     // In some cases maybe the thread can help and do itself
                                     // like before - i.e. set version_to_execute (not from scheduler)
                                     scheduler.schedule_txn(version_to_validate);
@@ -344,7 +333,7 @@ where
                                     abort_counter.fetch_add(1, Ordering::Relaxed);
                                 }
 
-                                last_validator_no_work = scheduler.finish_validation();
+                                scheduler.finish_validation();
                                 local_validation_time += local_timer.elapsed();
                                 local_timer = Instant::now();
 
@@ -373,7 +362,6 @@ where
                             continue;
                         }
 
-                        last_validator_no_work = false;
                         local_get_txn_to_exe_time += local_timer.elapsed();
                         local_timer = Instant::now();
 
@@ -510,8 +498,6 @@ where
                     *get_txn_to_exe = max(local_get_txn_to_exe_time, *get_txn_to_exe);
                     let mut nothing_to_exe = nothing_to_exe_time.lock().unwrap();
                     *nothing_to_exe = max(local_nothing_to_exe_time, *nothing_to_exe);
-                    let mut check_done = check_done_time.lock().unwrap();
-                    *check_done = max(local_check_done_time, *check_done);
                     let mut validation_read = validation_read_time.lock().unwrap();
                     *validation_read = max(local_validation_read_time, *validation_read);
                     let mut validation_write = validation_write_time.lock().unwrap();
@@ -524,7 +510,6 @@ where
                             + local_checking_time.as_millis()
                             + local_get_txn_to_exe_time.as_millis()
                             + local_nothing_to_exe_time.as_millis()
-                            + local_check_done_time.as_millis()
                             + local_validation_time.as_millis()
                             + local_apply_write_time.as_millis(),
                     );
@@ -604,7 +589,7 @@ where
         let total_time = timer_start.elapsed();
 
         println!("=====PERF=====\n mvhashmap_construction_time {:?}\n execution_loop_time {:?}\n set_output_time {:?}\n remaining_time {:?}\n\n total_time {:?}\n", mvhashmap_construction_time, execution_loop_time, set_output_time, remaining_time, total_time);
-        println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n check_done_time {:?}\n get_txn_to_exe_time {:?}\n nothing_to_exe_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time.lock().unwrap(), apply_write_time.lock().unwrap(), checking_time.lock().unwrap(), validation_time.lock().unwrap(), validation_read_time.lock().unwrap(), validation_write_time.lock().unwrap(), check_done_time.lock().unwrap(), get_txn_to_exe_time.lock().unwrap(), nothing_to_exe_time.lock().unwrap(), execution_time_vec.lock().unwrap(), loop_time_vec.lock().unwrap());
+        println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n get_txn_to_exe_time {:?}\n nothing_to_exe_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time.lock().unwrap(), apply_write_time.lock().unwrap(), checking_time.lock().unwrap(), validation_time.lock().unwrap(), validation_read_time.lock().unwrap(), validation_write_time.lock().unwrap(), get_txn_to_exe_time.lock().unwrap(), nothing_to_exe_time.lock().unwrap(), execution_time_vec.lock().unwrap(), loop_time_vec.lock().unwrap());
         // scheduler.print_info();
 
         ret
