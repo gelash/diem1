@@ -46,6 +46,10 @@ impl<
         std::mem::take(&mut reads)
     }
 
+    pub fn read_map(&self, key: &K) -> std::result::Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+        self.map.read(key, self.version)
+    }
+
     pub fn read(&self, key: &K) -> AResult<Option<V>> {
         loop {
             match self.map.read(key, self.version) {
@@ -78,16 +82,12 @@ impl<
 
     // Return a (true, version, exec_id) if the read returns a value,
     // or (false, version, exec_id) if read dependency, otherwise return None.
-    pub fn read_version_and_exec_id(&self, access_path: &K) -> Option<(usize, usize)> {
-        // reads may return Ok((Option<V>, version, exec_id) when there is value and no read dependency
-        // or Err(Some<version, exec_id>) when there is read dependency
-        // or Err(None) when there is no value and no read dependency
-        match self.map.read(access_path, self.version) {
-            Ok((_, version, exec_id)) => Some((version, exec_id)),
-            Err(Some((version, exec_id))) => Some((version, exec_id)),
-            Err(None) => None,
-        }
-    }
+    // pub fn read_version_and_exec_id(&self, access_path: &K) -> Option<(usize, usize)> {
+    //     // reads may return Ok((Option<V>, version, exec_id) when there is value and no read dependency
+    //     // or Err(Some<version, exec_id>) when there is read dependency
+    //     // or Err(None) when there is no value and no read dependency
+    //
+    // }
 
     // Apply the writes to both static and dynamic mvhashmap
     pub fn write(
@@ -293,7 +293,13 @@ where
                             || status_to_validate
                                 .read_set()
                                 .iter()
-                                .all(|r| r.validate(state_view.read_version_and_exec_id(r.path())));
+                                .all(|r| {
+                                    match state_view.read_map(r.path()) {
+                                        Ok((_, version, exec_id)) => r.validate(Some((version, exec_id))),
+                                        Err(Some(_)) => false, //dependency implies validation failure.
+                                        Err(None) => r.validate(None),
+                                    }
+                                });
                         local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -316,9 +322,9 @@ where
                             ret = scheduler.schedule_txn(version_to_validate, self.num_cpus / 4, o);
 
                             abort_counter.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            scheduler.finish_validation();
                         }
-
-                        scheduler.finish_validation();
 
                         ret
                     };

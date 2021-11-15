@@ -340,7 +340,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         buffer_threshold: usize,
         share_override: bool,
     ) -> Option<usize> {
-        self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+       // self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
 
         if !share_override && self.txn_buffer.len() > buffer_threshold {
             Some(version)
