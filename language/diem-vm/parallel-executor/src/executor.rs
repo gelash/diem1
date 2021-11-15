@@ -46,7 +46,10 @@ impl<
         std::mem::take(&mut reads)
     }
 
-    pub fn read_map(&self, key: &K) -> std::result::Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
+    pub fn read_map(
+        &self,
+        key: &K,
+    ) -> std::result::Result<(Option<V>, Version, usize), Option<(Version, usize)>> {
         self.map.read(key, self.version)
     }
 
@@ -79,15 +82,6 @@ impl<
             };
         }
     }
-
-    // Return a (true, version, exec_id) if the read returns a value,
-    // or (false, version, exec_id) if read dependency, otherwise return None.
-    // pub fn read_version_and_exec_id(&self, access_path: &K) -> Option<(usize, usize)> {
-    //     // reads may return Ok((Option<V>, version, exec_id) when there is value and no read dependency
-    //     // or Err(Some<version, exec_id>) when there is read dependency
-    //     // or Err(None) when there is no value and no read dependency
-    //
-    // }
 
     // Apply the writes to both static and dynamic mvhashmap
     pub fn write(
@@ -237,15 +231,11 @@ where
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
 
         let gen_id = AtomicUsize::new(0);
+        let compute_cpus = self.num_cpus;
+        let validator_workers = AtomicUsize::new(compute_cpus / 4);
+        let max_validator_workers = compute_cpus / 2;
 
         scope(|s| {
-            // How many threads to use?
-            // let compute_cpus = min(1 + (num_txns / 50), self.num_cpus - 1); // Ensure we have at least 50 tx per thread.
-            // let compute_cpus = min(num_txns / max(max_dependency_level, 1), compute_cpus); // Ensure we do not higher rate of conflict than concurrency.
-            // let compute_cpus = 7;
-
-            let compute_cpus = self.num_cpus;
-
             println!(
                 "Launching {} threads to execute (Max conflict {}) ... total txns: {:?}",
                 compute_cpus,
@@ -270,6 +260,9 @@ where
                     let mut local_validation_write_time = Duration::new(0, 0);
                     let mut local_timer = Instant::now();
 
+                    let mut nothing_to_validate_cnt = 0;
+                    let mut nothing_to_execute_cnt = 0;
+
                     let mut validate = |version_to_validate: usize, o: bool| -> Option<usize> {
                         let status_to_validate = scheduler.status(version_to_validate);
                         let mut ret = None;
@@ -290,16 +283,15 @@ where
                         // to skip validation - it is going to succeed (in order to be
                         // validating, all prior txn's must have been executed already).
                         let valid = versioned_data_cache.dynamic_empty()
-                            || status_to_validate
-                                .read_set()
-                                .iter()
-                                .all(|r| {
-                                    match state_view.read_map(r.path()) {
-                                        Ok((_, version, exec_id)) => r.validate(Some((version, exec_id))),
-                                        Err(Some(_)) => false, //dependency implies validation failure.
-                                        Err(None) => r.validate(None),
+                            || status_to_validate.read_set().iter().all(|r| {
+                                match state_view.read_map(r.path()) {
+                                    Ok((_, version, exec_id)) => {
+                                        r.validate(Some((version, exec_id)))
                                     }
-                                });
+                                    Err(Some(_)) => false, //dependency implies validation failure.
+                                    Err(None) => r.validate(None),
+                                }
+                            });
                         local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -338,10 +330,34 @@ where
                         let mut version_to_execute = None;
 
                         // First check if any txn can be validated
-                        if (id & 3) == 0 {
+                        let num_validators = validator_workers.load(Ordering::Relaxed);
+                        if id < num_validators {
                             if let Some(version_to_validate) = scheduler.next_txn_to_validate() {
                                 version_to_execute = validate(version_to_validate, false);
                                 local_validation_time += local_timer.elapsed();
+                                local_timer = Instant::now();
+
+                                nothing_to_validate_cnt = 0;
+                            } else {
+                                // Give up the resources so other threads can progress (HT).
+                                if id > 0 && id == num_validators - 1 {
+                                    nothing_to_validate_cnt = nothing_to_validate_cnt + 1;
+                                    // TODO: config parameter
+                                    if nothing_to_validate_cnt == 100 {
+                                        let _ = validator_workers.compare_exchange(
+                                            num_validators,
+                                            num_validators - 1,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        );
+                                        // println!("Decreased");
+                                        nothing_to_validate_cnt = 0;
+                                    }
+                                }
+
+                                hint::spin_loop();
+
+                                local_nothing_to_exe_time += local_timer.elapsed();
                                 local_timer = Instant::now();
                             }
 
@@ -358,6 +374,22 @@ where
                         }
 
                         if version_to_execute.is_none() {
+                            if id < max_validator_workers - 1 && id == num_validators {
+                                nothing_to_execute_cnt = nothing_to_execute_cnt + 1;
+
+                                if nothing_to_execute_cnt == 100 {
+                                    // TODO: config parameter
+                                    let _ = validator_workers.compare_exchange(
+                                        num_validators,
+                                        num_validators + 1,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    );
+                                    // println!("Increased");
+                                    nothing_to_execute_cnt = 0;
+                                }
+                            }
+
                             // Give up the resources so other threads can progress (HT).
                             hint::spin_loop();
 
@@ -366,6 +398,8 @@ where
 
                             // Nothing to execute, continue to the work loop.
                             continue;
+                        } else {
+                            nothing_to_execute_cnt = 0;
                         }
 
                         local_get_txn_to_exe_time += local_timer.elapsed();
