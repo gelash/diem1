@@ -343,7 +343,7 @@ where
                                 if id > 0 && id == num_validators - 1 {
                                     nothing_to_validate_cnt = nothing_to_validate_cnt + 1;
                                     // TODO: config parameter
-                                    if nothing_to_validate_cnt == 100 {
+                                    if nothing_to_validate_cnt == 10000 {
                                         let _ = validator_workers.compare_exchange(
                                             num_validators,
                                             num_validators - 1,
@@ -377,7 +377,7 @@ where
                             if id < max_validator_workers - 1 && id == num_validators {
                                 nothing_to_execute_cnt = nothing_to_execute_cnt + 1;
 
-                                if nothing_to_execute_cnt == 100 {
+                                if nothing_to_execute_cnt == 10000 {
                                     // TODO: config parameter
                                     let _ = validator_workers.compare_exchange(
                                         num_validators,
