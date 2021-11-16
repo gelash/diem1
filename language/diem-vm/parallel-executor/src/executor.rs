@@ -33,12 +33,12 @@ pub struct MVHashMapView<'a, K, V, T, E> {
 }
 
 impl<
-    'a,
-    K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Clone + Send + Sync,
-    T: TransactionOutput,
-    E: Send + Clone,
-> MVHashMapView<'a, K, V, T, E>
+        'a,
+        K: PartialOrd + Send + Clone + Hash + Eq,
+        V: Clone + Send + Sync,
+        T: TransactionOutput,
+        E: Send + Clone,
+    > MVHashMapView<'a, K, V, T, E>
 {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
@@ -151,10 +151,10 @@ pub struct ParallelTransactionExecutor<T: Transaction, E: ExecutorTask, I: ReadW
 }
 
 impl<T, E, I> ParallelTransactionExecutor<T, E, I>
-    where
-        T: Transaction,
-        E: ExecutorTask<T=T>,
-        I: ReadWriteSetInferencer<T=T>,
+where
+    T: Transaction,
+    E: ExecutorTask<T = T>,
+    I: ReadWriteSetInferencer<T = T>,
 {
     pub fn new(inferencer: I) -> Self {
         Self {
@@ -217,23 +217,30 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         let validation_counter = AtomicUsize::new(0);
 
         let mvhashmap_construction_time = timer.elapsed();
-        timer = Instant::now();
 
+        let dep_execution_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let execution_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let checking_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let validation_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let apply_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let nothing_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let get_txn_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+        let nothing_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+
+        let validation_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
+
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
+        let validation_time_vec = Arc::new(Mutex::new(Vec::new()));
+        let nothing_time_vec = Arc::new(Mutex::new(Vec::new()));
+        let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
 
         let gen_id = AtomicUsize::new(0);
         let compute_cpus = self.num_cpus;
         let validator_workers = AtomicUsize::new(compute_cpus / 4);
         let max_validator_workers = compute_cpus / 2;
+        let nothing_iter_threshold = 10000;
+
+        timer = Instant::now();
 
         scope(|s| {
             println!(
@@ -250,14 +257,18 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                     let task = E::init(task_initial_arguments);
 
+                    let mut local_dep_execution_time = Duration::new(0, 0);
                     let mut local_execution_time = Duration::new(0, 0);
                     let mut local_checking_time = Duration::new(0, 0);
                     let mut local_apply_write_time = Duration::new(0, 0);
                     let mut local_get_txn_to_exe_time = Duration::new(0, 0);
-                    let mut local_nothing_to_exe_time = Duration::new(0, 0);
+
+                    let mut local_nothing_time = Duration::new(0, 0);
+
                     let mut local_validation_time = Duration::new(0, 0);
                     let mut local_validation_read_time = Duration::new(0, 0);
                     let mut local_validation_write_time = Duration::new(0, 0);
+
                     let mut local_timer = Instant::now();
 
                     let mut nothing_to_validate_cnt = 0;
@@ -284,14 +295,14 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         // validating, all prior txn's must have been executed already).
                         let valid = versioned_data_cache.dynamic_empty()
                             || status_to_validate.read_set().iter().all(|r| {
-                            match state_view.read_map(r.path()) {
-                                Ok((_, version, exec_id)) => {
-                                    r.validate(Some((version, exec_id)))
+                                match state_view.read_map(r.path()) {
+                                    Ok((_, version, exec_id)) => {
+                                        r.validate(Some((version, exec_id)))
+                                    }
+                                    Err(Some(_)) => false, //dependency implies validation failure.
+                                    Err(None) => r.validate(None),
                                 }
-                                Err(Some(_)) => false, //dependency implies validation failure.
-                                Err(None) => r.validate(None),
-                            }
-                        });
+                            });
                         local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -323,6 +334,8 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                     loop {
                         if scheduler.done() {
+                            local_nothing_time += local_timer.elapsed();
+
                             // The work is done, break from the loop.
                             break;
                         }
@@ -342,9 +355,9 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                 // Give up the resources so other threads can progress (HT).
                                 let mut hint = true;
                                 if id > 0 && id == num_validators - 1 {
-                                    nothing_to_validate_cnt = nothing_to_validate_cnt + 1;
+                                    nothing_to_validate_cnt += 1;
                                     // TODO: config parameter
-                                    if nothing_to_validate_cnt == 10000 {
+                                    if nothing_to_validate_cnt == nothing_iter_threshold {
                                         validator_workers.fetch_sub(1, Ordering::Relaxed);
 
                                         // let _ = validator_workers.compare_exchange(
@@ -364,7 +377,7 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                     hint::spin_loop();
                                 }
 
-                                local_nothing_to_exe_time += local_timer.elapsed();
+                                local_nothing_time += local_timer.elapsed();
                                 local_timer = Instant::now();
                             }
 
@@ -381,12 +394,11 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         }
 
                         if version_to_execute.is_none() {
-
                             let mut hint = true;
                             if id < max_validator_workers - 1 && id == num_validators {
-                                nothing_to_execute_cnt = nothing_to_execute_cnt + 1;
+                                nothing_to_execute_cnt += 1;
 
-                                if nothing_to_execute_cnt == 10000 {
+                                if nothing_to_execute_cnt == nothing_iter_threshold {
                                     // TODO: config parameter
 
                                     validator_workers.fetch_add(1, Ordering::Relaxed);
@@ -402,13 +414,11 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                 }
                             }
 
-                            // Give up the resources so other threads can progress (HT).
-
                             if hint {
                                 hint::spin_loop();
                             }
 
-                            local_nothing_to_exe_time += local_timer.elapsed();
+                            local_nothing_time += local_timer.elapsed();
                             local_timer = Instant::now();
 
                             // Nothing to execute, continue to the work loop.
@@ -421,7 +431,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         local_timer = Instant::now();
 
                         let txn_to_execute = version_to_execute.unwrap();
-
                         let txn = &signature_verified_block[txn_to_execute];
 
                         let state_view = MVHashMapView {
@@ -436,7 +445,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                         // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
                         if txn_accesses.keys_read.iter().any(|k| {
-                            // match versioned_data_cache.read_from_static(k, txn_to_execute) {
                             match versioned_data_cache.read(k, txn_to_execute) {
                                 Err(Some((dep_id, _))) => {
                                     scheduler.add_dependency(txn_to_execute, dep_id)
@@ -457,14 +465,17 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
 
                         let execute_result = task.execute_transaction(&state_view, txn);
 
-                        local_execution_time += local_timer.elapsed();
-                        local_timer = Instant::now();
-
                         if state_view.read_dependency() {
+                            local_dep_execution_time += local_timer.elapsed();
+                            local_timer = Instant::now();
+
                             // We've already added this transaction back to the scheduler in the
                             // MVHashmapView where this bit is set, thus it is safe to continue
                             // here.
                             continue;
+                        } else {
+                            local_execution_time += local_timer.elapsed();
+                            local_timer = Instant::now();
                         }
 
                         let original_estimates: HashSet<T::Key> =
@@ -566,33 +577,48 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         }
                     }
 
+                    let mut dep_execution = dep_execution_time.lock().unwrap();
+                    *dep_execution = max(local_dep_execution_time, *dep_execution);
                     let mut execution = execution_time.lock().unwrap();
                     *execution = max(local_execution_time, *execution);
+                    let mut execution_vec = execution_time_vec.lock().unwrap();
+                    execution_vec.push((
+                        id,
+                        local_execution_time.as_millis() + local_dep_execution_time.as_millis(),
+                    ));
+
                     let mut checking = checking_time.lock().unwrap();
                     *checking = max(local_checking_time, *checking);
-                    let mut validation = validation_time.lock().unwrap();
-                    *validation = max(local_validation_time, *validation);
                     let mut apply_write = apply_write_time.lock().unwrap();
                     *apply_write = max(local_apply_write_time, *apply_write);
                     let mut get_txn_to_exe = get_txn_to_exe_time.lock().unwrap();
                     *get_txn_to_exe = max(local_get_txn_to_exe_time, *get_txn_to_exe);
-                    let mut nothing_to_exe = nothing_to_exe_time.lock().unwrap();
-                    *nothing_to_exe = max(local_nothing_to_exe_time, *nothing_to_exe);
+
+                    let mut nothing = nothing_time.lock().unwrap();
+                    *nothing = max(local_nothing_time, *nothing);
+                    let mut nothing_vec = nothing_time_vec.lock().unwrap();
+                    nothing_vec.push((id, local_nothing_time.as_millis()));
+
                     let mut validation_read = validation_read_time.lock().unwrap();
                     *validation_read = max(local_validation_read_time, *validation_read);
                     let mut validation_write = validation_write_time.lock().unwrap();
                     *validation_write = max(local_validation_write_time, *validation_write);
-                    let mut execution_vec = execution_time_vec.lock().unwrap();
-                    execution_vec.push(local_execution_time.as_millis());
+                    let mut validation = validation_time.lock().unwrap();
+                    *validation = max(local_validation_time, *validation);
+                    let mut validation_vec = validation_time_vec.lock().unwrap();
+                    validation_vec.push((id, local_validation_time.as_millis()));
+
                     let mut loop_vec = loop_time_vec.lock().unwrap();
-                    loop_vec.push(
-                        local_execution_time.as_millis()
+                    loop_vec.push((
+                        id,
+                        local_dep_execution_time.as_millis()
+                            + local_execution_time.as_millis()
                             + local_checking_time.as_millis()
                             + local_get_txn_to_exe_time.as_millis()
-                            + local_nothing_to_exe_time.as_millis()
+                            + local_nothing_time.as_millis()
                             + local_validation_time.as_millis()
                             + local_apply_write_time.as_millis(),
-                    );
+                    ));
                 });
             }
         });
@@ -667,9 +693,58 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         let remaining_time = timer.elapsed();
         let total_time = timer_start.elapsed();
 
-        println!("=====PERF=====\n mvhashmap_construction_time {:?}\n execution_loop_time {:?}\n set_output_time {:?}\n remaining_time {:?}\n\n total_time {:?}\n", mvhashmap_construction_time, execution_loop_time, set_output_time, remaining_time, total_time);
-        println!("=====INSIDE THE LOOP (max among all threads)=====\n execution_time {:?}\n apply_write_time {:?}\n checking_time {:?}\n validation_time {:?}\n validation_read_time {:?}\n validation_write_time {:?}\n get_txn_to_exe_time {:?}\n nothing_to_exe_time {:?}\n execution_time_vec {:?}\n loop_time_vec {:?}\n", execution_time.lock().unwrap(), apply_write_time.lock().unwrap(), checking_time.lock().unwrap(), validation_time.lock().unwrap(), validation_read_time.lock().unwrap(), validation_write_time.lock().unwrap(), get_txn_to_exe_time.lock().unwrap(), nothing_to_exe_time.lock().unwrap(), execution_time_vec.lock().unwrap(), loop_time_vec.lock().unwrap());
-        // scheduler.print_info();
+        println!(
+            "=====PERF=====\n\
+                mvhashmap_construction_time {:?},\n\
+                execution_loop_time {:?},\n\
+                set_output_time {:?},\n\
+                remaining_time {:?},\n\
+                total_time {:?}\n",
+            mvhashmap_construction_time,
+            execution_loop_time,
+            set_output_time,
+            remaining_time,
+            total_time
+        );
+
+        println!(
+            "=====INSIDE THE LOOP (max among all threads)=====,\n\
+                get_txn_to_exe_time {:?},\n\
+                dep_execution_time (till read error) {:?},\n\
+                execution_time (no read error) {:?},\n\
+                apply_write_time {:?},\n\
+                read_pre_checking_time {:?},\n\
+                validation_time {:?},\n\
+                validation_read_time (counted in val) {:?},\n\
+                validation_write_time (counted in val) {:?},\n\
+                nothing_time {:?}\n",
+            get_txn_to_exe_time.lock().unwrap(),
+            dep_execution_time.lock().unwrap(),
+            execution_time.lock().unwrap(),
+            apply_write_time.lock().unwrap(),
+            checking_time.lock().unwrap(),
+            validation_time.lock().unwrap(),
+            validation_read_time.lock().unwrap(),
+            validation_write_time.lock().unwrap(),
+            nothing_time.lock().unwrap(),
+        );
+
+        execution_time_vec.lock().unwrap().sort();
+        validation_time_vec.lock().unwrap().sort();
+        nothing_time_vec.lock().unwrap().sort();
+        loop_time_vec.lock().unwrap().sort();
+
+        println!(
+            "=====INSIDE THE LOOP (vec with thread IDs)=====,\n\
+               execution_time {:?},\n\
+               validation_time {:?},\n\
+               nothing_time {:?},\n\
+               loop_time {:?}\n",
+            execution_time_vec.lock().unwrap(),
+            validation_time_vec.lock().unwrap(),
+            nothing_time_vec.lock().unwrap(),
+            loop_time_vec.lock().unwrap(),
+        );
 
         ret
     }
