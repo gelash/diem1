@@ -32,6 +32,8 @@ pub struct MVHashMapView<'a, K, V, T, E> {
     reads: Arc<Mutex<Vec<ReadDescriptor<K>>>>,
 }
 
+const NOTHING_ITER_THRESHOLD: usize = 10000;
+
 impl<
         'a,
         K: PartialOrd + Send + Clone + Hash + Eq,
@@ -222,8 +224,8 @@ where
         let execution_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let checking_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let apply_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let get_txn_to_exe_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let nothing_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+
+        let other_time = Arc::new(Mutex::new(Duration::new(0, 0)));
 
         let validation_time = Arc::new(Mutex::new(Duration::new(0, 0)));
         let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
@@ -231,16 +233,15 @@ where
 
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
         let validation_time_vec = Arc::new(Mutex::new(Vec::new()));
-        let nothing_time_vec = Arc::new(Mutex::new(Vec::new()));
+        let other_time_vec = Arc::new(Mutex::new(Vec::new()));
         let loop_time_vec = Arc::new(Mutex::new(Vec::new()));
+
+        timer = Instant::now();
 
         let gen_id = AtomicUsize::new(0);
         let compute_cpus = self.num_cpus;
         let validator_workers = AtomicUsize::new(compute_cpus / 4);
         let max_validator_workers = compute_cpus / 2;
-        let nothing_iter_threshold = 10000;
-
-        timer = Instant::now();
 
         scope(|s| {
             println!(
@@ -261,15 +262,12 @@ where
                     let mut local_execution_time = Duration::new(0, 0);
                     let mut local_checking_time = Duration::new(0, 0);
                     let mut local_apply_write_time = Duration::new(0, 0);
-                    let mut local_get_txn_to_exe_time = Duration::new(0, 0);
 
-                    let mut local_nothing_time = Duration::new(0, 0);
+                    let mut local_other_time = Duration::new(0, 0);
 
                     let mut local_validation_time = Duration::new(0, 0);
                     let mut local_validation_read_time = Duration::new(0, 0);
                     let mut local_validation_write_time = Duration::new(0, 0);
-
-                    let mut local_timer = Instant::now();
 
                     let mut nothing_to_validate_cnt = 0;
                     let mut nothing_to_execute_cnt = 0;
@@ -332,9 +330,13 @@ where
                         ret
                     };
 
+                    let mut other_timer = Instant::now();
+                    let mut local_timer;
+                    // let loop_timer = Instant::now();
                     loop {
                         if scheduler.done() {
-                            local_nothing_time += local_timer.elapsed();
+                            local_other_time += other_timer.elapsed();
+                            // println!("id = {}, Loop timer = {:?}", id, loop_timer.elapsed());
 
                             // The work is done, break from the loop.
                             break;
@@ -346,9 +348,13 @@ where
                         let num_validators = validator_workers.load(Ordering::Relaxed);
                         if id < num_validators {
                             if let Some(version_to_validate) = scheduler.next_txn_to_validate() {
-                                version_to_execute = validate(version_to_validate, false);
-                                local_validation_time += local_timer.elapsed();
+                                local_other_time += other_timer.elapsed();
                                 local_timer = Instant::now();
+
+                                version_to_execute = validate(version_to_validate, false);
+
+                                local_validation_time += local_timer.elapsed();
+                                other_timer = Instant::now();
 
                                 nothing_to_validate_cnt = 0;
                             } else {
@@ -356,16 +362,10 @@ where
                                 if id > 0 && id == num_validators - 1 {
                                     nothing_to_validate_cnt += 1;
                                     // TODO: config parameter
-                                    if nothing_to_validate_cnt == nothing_iter_threshold {
+                                    if nothing_to_validate_cnt == NOTHING_ITER_THRESHOLD {
+                                        // TODO: is CAS easier to reason about?
                                         validator_workers.fetch_sub(1, Ordering::Relaxed);
 
-                                        // let _ = validator_workers.compare_exchange(
-                                        //     num_validators,
-                                        //     num_validators - 1,
-                                        //     Ordering::SeqCst,
-                                        //     Ordering::SeqCst,
-                                        // );
-                                        // println!("Decreased");
                                         nothing_to_validate_cnt = 0;
 
                                         hint = false;
@@ -375,9 +375,6 @@ where
                                 if hint {
                                     hint::spin_loop();
                                 }
-
-                                local_nothing_time += local_timer.elapsed();
-                                local_timer = Instant::now();
                             }
 
                             if version_to_execute.is_none() {
@@ -389,7 +386,6 @@ where
 
                         if version_to_execute.is_none() {
                             version_to_execute = scheduler.next_txn_to_execute();
-                            // If there is no txn to be committed or validated, get the next txn to execute
                         }
 
                         if version_to_execute.is_none() {
@@ -397,17 +393,11 @@ where
                             if id < max_validator_workers - 1 && id == num_validators {
                                 nothing_to_execute_cnt += 1;
 
-                                if nothing_to_execute_cnt == nothing_iter_threshold {
+                                if nothing_to_execute_cnt == NOTHING_ITER_THRESHOLD {
                                     // TODO: config parameter
-
+                                    // TODO: is CAS easier to reason about?
                                     validator_workers.fetch_add(1, Ordering::Relaxed);
-                                    // let _ = validator_workers.compare_exchange(
-                                    //     num_validators,
-                                    //     num_validators + 1,
-                                    //     Ordering::SeqCst,
-                                    //     Ordering::SeqCst,
-                                    // );
-                                    // println!("Increased");
+
                                     nothing_to_execute_cnt = 0;
                                     hint = false;
                                 }
@@ -417,16 +407,13 @@ where
                                 hint::spin_loop();
                             }
 
-                            local_nothing_time += local_timer.elapsed();
-                            local_timer = Instant::now();
-
                             // Nothing to execute, continue to the work loop.
                             continue;
                         } else {
                             nothing_to_execute_cnt = 0;
                         }
 
-                        local_get_txn_to_exe_time += local_timer.elapsed();
+                        local_other_time += other_timer.elapsed();
                         local_timer = Instant::now();
 
                         let txn_to_execute = version_to_execute.unwrap();
@@ -454,7 +441,7 @@ where
                             delay_execution_counter.fetch_add(1, Ordering::Relaxed);
 
                             local_checking_time += local_timer.elapsed();
-                            local_timer = Instant::now();
+                            other_timer = Instant::now();
 
                             continue;
                         }
@@ -466,7 +453,7 @@ where
 
                         if state_view.read_dependency() {
                             local_dep_execution_time += local_timer.elapsed();
-                            local_timer = Instant::now();
+                            other_timer = Instant::now();
 
                             // We've already added this transaction back to the scheduler in the
                             // MVHashmapView where this bit is set, thus it is safe to continue
@@ -572,8 +559,8 @@ where
                                 panic!("didn't schedule");
                             }
                             local_validation_time += local_timer.elapsed();
-                            local_timer = Instant::now();
                         }
+                        other_timer = Instant::now();
                     }
 
                     let mut dep_execution = dep_execution_time.lock().unwrap();
@@ -590,13 +577,11 @@ where
                     *checking = max(local_checking_time, *checking);
                     let mut apply_write = apply_write_time.lock().unwrap();
                     *apply_write = max(local_apply_write_time, *apply_write);
-                    let mut get_txn_to_exe = get_txn_to_exe_time.lock().unwrap();
-                    *get_txn_to_exe = max(local_get_txn_to_exe_time, *get_txn_to_exe);
 
-                    let mut nothing = nothing_time.lock().unwrap();
-                    *nothing = max(local_nothing_time, *nothing);
-                    let mut nothing_vec = nothing_time_vec.lock().unwrap();
-                    nothing_vec.push((id, local_nothing_time.as_millis()));
+                    let mut other = other_time.lock().unwrap();
+                    *other = max(local_other_time, *other);
+                    let mut other_vec = other_time_vec.lock().unwrap();
+                    other_vec.push((id, local_other_time.as_millis()));
 
                     let mut validation_read = validation_read_time.lock().unwrap();
                     *validation_read = max(local_validation_read_time, *validation_read);
@@ -613,8 +598,7 @@ where
                         local_dep_execution_time.as_millis()
                             + local_execution_time.as_millis()
                             + local_checking_time.as_millis()
-                            + local_get_txn_to_exe_time.as_millis()
-                            + local_nothing_time.as_millis()
+                            + local_other_time.as_millis()
                             + local_validation_time.as_millis()
                             + local_apply_write_time.as_millis(),
                     ));
@@ -708,7 +692,6 @@ where
 
         println!(
             "=====INSIDE THE LOOP (max among all threads)=====,\n\
-                get_txn_to_exe_time {:?},\n\
                 dep_execution_time (till read error) {:?},\n\
                 execution_time (no read error) {:?},\n\
                 apply_write_time {:?},\n\
@@ -716,8 +699,7 @@ where
                 validation_time {:?},\n\
                 validation_read_time (counted in val) {:?},\n\
                 validation_write_time (counted in val) {:?},\n\
-                nothing_time {:?}\n",
-            get_txn_to_exe_time.lock().unwrap(),
+                other_time (incl get next val or exec) {:?}\n",
             dep_execution_time.lock().unwrap(),
             execution_time.lock().unwrap(),
             apply_write_time.lock().unwrap(),
@@ -725,23 +707,23 @@ where
             validation_time.lock().unwrap(),
             validation_read_time.lock().unwrap(),
             validation_write_time.lock().unwrap(),
-            nothing_time.lock().unwrap(),
+            other_time.lock().unwrap(),
         );
 
         execution_time_vec.lock().unwrap().sort();
         validation_time_vec.lock().unwrap().sort();
-        nothing_time_vec.lock().unwrap().sort();
+        other_time_vec.lock().unwrap().sort();
         loop_time_vec.lock().unwrap().sort();
 
         println!(
             "=====INSIDE THE LOOP (vec with thread IDs)=====,\n\
                execution_time {:?},\n\
                validation_time {:?},\n\
-               nothing_time {:?},\n\
+               other_time {:?},\n\
                loop_time {:?}\n",
             execution_time_vec.lock().unwrap(),
             validation_time_vec.lock().unwrap(),
-            nothing_time_vec.lock().unwrap(),
+            other_time_vec.lock().unwrap(),
             loop_time_vec.lock().unwrap(),
         );
 
