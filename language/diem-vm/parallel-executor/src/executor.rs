@@ -33,12 +33,12 @@ pub struct MVHashMapView<'a, K, V, T, E> {
 }
 
 impl<
-        'a,
-        K: PartialOrd + Send + Clone + Hash + Eq,
-        V: Clone + Send + Sync,
-        T: TransactionOutput,
-        E: Send + Clone,
-    > MVHashMapView<'a, K, V, T, E>
+    'a,
+    K: PartialOrd + Send + Clone + Hash + Eq,
+    V: Clone + Send + Sync,
+    T: TransactionOutput,
+    E: Send + Clone,
+> MVHashMapView<'a, K, V, T, E>
 {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
@@ -151,10 +151,10 @@ pub struct ParallelTransactionExecutor<T: Transaction, E: ExecutorTask, I: ReadW
 }
 
 impl<T, E, I> ParallelTransactionExecutor<T, E, I>
-where
-    T: Transaction,
-    E: ExecutorTask<T = T>,
-    I: ReadWriteSetInferencer<T = T>,
+    where
+        T: Transaction,
+        E: ExecutorTask<T=T>,
+        I: ReadWriteSetInferencer<T=T>,
 {
     pub fn new(inferencer: I) -> Self {
         Self {
@@ -284,14 +284,14 @@ where
                         // validating, all prior txn's must have been executed already).
                         let valid = versioned_data_cache.dynamic_empty()
                             || status_to_validate.read_set().iter().all(|r| {
-                                match state_view.read_map(r.path()) {
-                                    Ok((_, version, exec_id)) => {
-                                        r.validate(Some((version, exec_id)))
-                                    }
-                                    Err(Some(_)) => false, //dependency implies validation failure.
-                                    Err(None) => r.validate(None),
+                            match state_view.read_map(r.path()) {
+                                Ok((_, version, exec_id)) => {
+                                    r.validate(Some((version, exec_id)))
                                 }
-                            });
+                                Err(Some(_)) => false, //dependency implies validation failure.
+                                Err(None) => r.validate(None),
+                            }
+                        });
                         local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -340,22 +340,29 @@ where
                                 nothing_to_validate_cnt = 0;
                             } else {
                                 // Give up the resources so other threads can progress (HT).
+                                let mut hint = true;
                                 if id > 0 && id == num_validators - 1 {
                                     nothing_to_validate_cnt = nothing_to_validate_cnt + 1;
                                     // TODO: config parameter
                                     if nothing_to_validate_cnt == 10000 {
-                                        let _ = validator_workers.compare_exchange(
-                                            num_validators,
-                                            num_validators - 1,
-                                            Ordering::SeqCst,
-                                            Ordering::SeqCst,
-                                        );
+                                        validator_workers.fetch_sub(1, Ordering::Relaxed);
+
+                                        // let _ = validator_workers.compare_exchange(
+                                        //     num_validators,
+                                        //     num_validators - 1,
+                                        //     Ordering::SeqCst,
+                                        //     Ordering::SeqCst,
+                                        // );
                                         // println!("Decreased");
                                         nothing_to_validate_cnt = 0;
+
+                                        hint = false;
                                     }
                                 }
 
-                                hint::spin_loop();
+                                if hint {
+                                    hint::spin_loop();
+                                }
 
                                 local_nothing_to_exe_time += local_timer.elapsed();
                                 local_timer = Instant::now();
@@ -374,24 +381,32 @@ where
                         }
 
                         if version_to_execute.is_none() {
+
+                            let mut hint = true;
                             if id < max_validator_workers - 1 && id == num_validators {
                                 nothing_to_execute_cnt = nothing_to_execute_cnt + 1;
 
                                 if nothing_to_execute_cnt == 10000 {
                                     // TODO: config parameter
-                                    let _ = validator_workers.compare_exchange(
-                                        num_validators,
-                                        num_validators + 1,
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst,
-                                    );
+
+                                    validator_workers.fetch_add(1, Ordering::Relaxed);
+                                    // let _ = validator_workers.compare_exchange(
+                                    //     num_validators,
+                                    //     num_validators + 1,
+                                    //     Ordering::SeqCst,
+                                    //     Ordering::SeqCst,
+                                    // );
                                     // println!("Increased");
                                     nothing_to_execute_cnt = 0;
+                                    hint = false;
                                 }
                             }
 
                             // Give up the resources so other threads can progress (HT).
-                            hint::spin_loop();
+
+                            if hint {
+                                hint::spin_loop();
+                            }
 
                             local_nothing_to_exe_time += local_timer.elapsed();
                             local_timer = Instant::now();
