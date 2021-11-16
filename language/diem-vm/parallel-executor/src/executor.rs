@@ -352,8 +352,7 @@ where
 
                                 nothing_to_validate_cnt = 0;
                             } else {
-                                // Give up the resources so other threads can progress (HT).
-                                let mut hint = true;
+                                let mut hint: bool = id > 0; // Don't let 0 wait, may need to set done.
                                 if id > 0 && id == num_validators - 1 {
                                     nothing_to_validate_cnt += 1;
                                     // TODO: config parameter
