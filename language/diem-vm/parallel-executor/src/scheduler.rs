@@ -107,6 +107,7 @@ pub struct Scheduler<K, T, E> {
     // Shared number of txns to execute: updated before executing a block or when an error or
     // reconfiguration leads to early stopping (at that transaction version).
     stop_at_version: AtomicUsize,
+    block_size: usize,
 
     txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
     txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
@@ -121,10 +122,11 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         Self {
             execution_marker: AtomicUsize::new(0),
             validation_marker: AtomicU64::new(0),
-            num_active_tasks: AtomicUsize::new(0),
+            num_active_tasks: AtomicUsize::new(num_txns),
             done_marker: AtomicUsize::new(0),
             execution_marker_done: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
+            block_size: num_txns,
             txn_buffer: SegQueue::new(),
             txn_dependency: (0..num_txns)
                 .map(|_| Arc::new(Mutex::new(Vec::new())))
@@ -252,15 +254,17 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 return None;
             }
 
-            self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+            //self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
             let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
             if next_to_execute < self.num_txn_to_execute() {
                 Some(next_to_execute)
-            } else {
+            } else if next_to_execute < self.block_size {
+                self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                None
+            } else{
                 // Everything executed at least once - validation will take care of rest.
                 self.execution_marker_done.store(1, Ordering::Relaxed);
-
-                self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                //self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
                 None
             }
         } else if let Some(version) = self.txn_buffer.pop() {

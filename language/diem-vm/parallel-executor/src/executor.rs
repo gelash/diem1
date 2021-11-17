@@ -228,8 +228,8 @@ where
         let other_time = Arc::new(Mutex::new(Duration::new(0, 0)));
 
         let validation_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
-        let validation_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+        //let validation_read_time = Arc::new(Mutex::new(Duration::new(0, 0)));
+        //let validation_write_time = Arc::new(Mutex::new(Duration::new(0, 0)));
 
         let execution_time_vec = Arc::new(Mutex::new(Vec::new()));
         let validation_time_vec = Arc::new(Mutex::new(Vec::new()));
@@ -238,7 +238,7 @@ where
 
         timer = Instant::now();
 
-        let gen_id = AtomicUsize::new(0);
+        let id_gen = AtomicUsize::new(0);
         let compute_cpus = self.num_cpus;
         let validator_workers = AtomicUsize::new(compute_cpus / 4);
         let max_validator_workers = compute_cpus / 2;
@@ -254,7 +254,7 @@ where
             for _ in 0..(compute_cpus) {
                 s.spawn(|_| {
                     // Make a new executor per thread.
-                    let id: usize = gen_id.fetch_add(1, Ordering::Relaxed);
+                    let id: usize = id_gen.fetch_add(1, Ordering::Relaxed);
 
                     let task = E::init(task_initial_arguments);
 
@@ -266,8 +266,8 @@ where
                     let mut local_other_time = Duration::new(0, 0);
 
                     let mut local_validation_time = Duration::new(0, 0);
-                    let mut local_validation_read_time = Duration::new(0, 0);
-                    let mut local_validation_write_time = Duration::new(0, 0);
+                    //let mut local_validation_read_time = Duration::new(0, 0);
+                    //let mut local_validation_write_time = Duration::new(0, 0);
 
                     let mut nothing_to_validate_cnt = 0;
                     let mut nothing_to_execute_cnt = 0;
@@ -287,7 +287,7 @@ where
                             reads: Arc::new(Mutex::new(Vec::new())),
                         };
 
-                        let read_timer = Instant::now();
+                        //let read_timer = Instant::now();
                         // If dynamic mv data-structure hasn't been written to, it's safe
                         // to skip validation - it is going to succeed (in order to be
                         // validating, all prior txn's must have been executed already).
@@ -301,13 +301,13 @@ where
                                     Err(None) => r.validate(None),
                                 }
                             });
-                        local_validation_read_time += read_timer.elapsed();
+                        //local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
                             // Not valid && successfully aborted.
 
                             // Set dirty in both static and dynamic mvhashmaps.
-                            let write_timer = Instant::now();
+                            //let write_timer = Instant::now();
                             state_view.mark_dirty(
                                 version_to_validate,
                                 status_to_validate.exec_id(),
@@ -318,7 +318,7 @@ where
                                     .collect(),
                                 &status_to_validate.write_set(),
                             );
-                            local_validation_write_time += write_timer.elapsed();
+                            //local_validation_write_time += write_timer.elapsed();
 
                             ret = scheduler.schedule_txn(version_to_validate, self.num_cpus / 4, o);
 
@@ -349,11 +349,11 @@ where
                         if id < num_validators {
                             if let Some(version_to_validate) = scheduler.next_txn_to_validate() {
                                 local_other_time += other_timer.elapsed();
+
                                 local_timer = Instant::now();
-
                                 version_to_execute = validate(version_to_validate, false);
-
                                 local_validation_time += local_timer.elapsed();
+
                                 other_timer = Instant::now();
 
                                 nothing_to_validate_cnt = 0;
@@ -583,10 +583,10 @@ where
                     let mut other_vec = other_time_vec.lock().unwrap();
                     other_vec.push((id, local_other_time.as_millis()));
 
-                    let mut validation_read = validation_read_time.lock().unwrap();
-                    *validation_read = max(local_validation_read_time, *validation_read);
-                    let mut validation_write = validation_write_time.lock().unwrap();
-                    *validation_write = max(local_validation_write_time, *validation_write);
+                    // let mut validation_read = validation_read_time.lock().unwrap();
+                    // *validation_read = max(local_validation_read_time, *validation_read);
+                    // let mut validation_write = validation_write_time.lock().unwrap();
+                    // *validation_write = max(local_validation_write_time, *validation_write);
                     let mut validation = validation_time.lock().unwrap();
                     *validation = max(local_validation_time, *validation);
                     let mut validation_vec = validation_time_vec.lock().unwrap();
@@ -697,16 +697,14 @@ where
                 apply_write_time {:?},\n\
                 read_pre_checking_time {:?},\n\
                 validation_time {:?},\n\
-                validation_read_time (counted in val) {:?},\n\
-                validation_write_time (counted in val) {:?},\n\
                 other_time (incl get next val or exec) {:?}\n",
             dep_execution_time.lock().unwrap(),
             execution_time.lock().unwrap(),
             apply_write_time.lock().unwrap(),
             checking_time.lock().unwrap(),
             validation_time.lock().unwrap(),
-            validation_read_time.lock().unwrap(),
-            validation_write_time.lock().unwrap(),
+            //validation_read_time.lock().unwrap(),
+            //validation_write_time.lock().unwrap(),
             other_time.lock().unwrap(),
         );
 
