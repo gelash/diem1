@@ -46,7 +46,12 @@ pub trait ReadWriteSetInferencer: Sync {
     /// approximation for now.
     fn infer_reads_writes(&self, txn: &Self::T) -> Result<Accesses<<Self::T as Transaction>::Key>>;
 
-    fn infer_results(&mut self, block: &Vec<Self::T>, write_keep_rate: f32) -> usize;
+    fn infer_results(
+        &mut self,
+        block: &Vec<Self::T>,
+        write_keep_rate: f32,
+        read_keep_rate: f32,
+    ) -> usize;
 
     fn result(&self, block: &Vec<Self::T>) -> Vec<Accesses<<Self::T as Transaction>::Key>>;
 }

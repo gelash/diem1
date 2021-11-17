@@ -84,6 +84,7 @@ where
                     self.num_accounts,
                     self.num_transactions,
                     1.0,
+                    1.0,
                 )
             },
             |state| state.execute(),
@@ -98,27 +99,42 @@ where
         num_accounts: usize,
         num_txn: usize,
         write_keep_rate: f32,
+        read_keep_rate: f32,
+        num_warmups: usize,
+        num_runs: usize,
     ) -> Vec<(usize, usize)> {
         let mut ret = Vec::new();
 
-        for i in 0..13 {
+        let total_runs = num_warmups + num_runs;
+        for i in 0..total_runs {
             let state = ParallelBenchState::with_size(
                 &self.strategy,
                 num_accounts,
                 num_txn,
                 write_keep_rate,
+                read_keep_rate,
             );
 
-            if i < 3 {
+            if i < num_warmups {
                 println!("WARMUP - ignore reults");
                 state.execute();
             } else {
-                println!("RUN bencher for: num_threads = {}, block_size = {}, num_account = {}, write_rate = {}", num_cpus::get(), num_txn, num_accounts, write_keep_rate);
+                println!(
+                    "RUN bencher for: num_threads = {}, \
+                          block_size = {}, \
+                          num_account = {}, \
+                          write_rate = {:?}, \
+                          read_rate = {:?}",
+                    num_cpus::get(),
+                    num_txn,
+                    num_accounts,
+                    write_keep_rate,
+                    read_keep_rate,
+                );
                 ret.push(state.execute());
             }
         }
 
-        // println!("{:?}", ret);
         ret
     }
 }
@@ -215,6 +231,7 @@ struct ParallelBenchState {
     bench_state: TransactionBenchState,
     infer_results: NormalizedReadWriteSetAnalysis,
     write_keep_rate: f32,
+    read_keep_rate: f32,
 }
 
 impl ParallelBenchState {
@@ -224,6 +241,7 @@ impl ParallelBenchState {
         num_accounts: usize,
         num_transactions: usize,
         write_keep_rate: f32,
+        read_keep_rate: f32,
     ) -> Self
     where
         S: Strategy,
@@ -239,6 +257,7 @@ impl ParallelBenchState {
                 .unwrap()
                 .normalize_all_scripts(add_on_functions_list()),
             write_keep_rate,
+            read_keep_rate,
         }
     }
 
@@ -257,6 +276,7 @@ impl ParallelBenchState {
             txns,
             state_view,
             self.write_keep_rate,
+            self.read_keep_rate,
         )
     }
 }

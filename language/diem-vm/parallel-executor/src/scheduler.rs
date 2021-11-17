@@ -239,7 +239,8 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     pub fn status(&self, version: usize) -> Arc<STMStatus<K, T, E>> {
-        self.txn_status[version].load_full().unwrap().clone()
+        // TODO: Get rid of smart pointer clone, use load() and values maybe.
+        self.txn_status[version].load_full().unwrap()
     }
 
     // Return the next txn id for the thread to execute: first fetch from the shared queue that
@@ -261,7 +262,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             } else if next_to_execute < self.block_size {
                 self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
                 None
-            } else{
+            } else {
                 // Everything executed at least once - validation will take care of rest.
                 self.execution_marker_done.store(1, Ordering::Relaxed);
                 //self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
@@ -344,7 +345,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         buffer_threshold: usize,
         share_override: bool,
     ) -> Option<usize> {
-       // self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+        // self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
 
         if !share_override && self.txn_buffer.len() > buffer_threshold {
             Some(version)

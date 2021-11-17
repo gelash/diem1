@@ -158,7 +158,12 @@ where
         }
     }
 
-    fn infer_results(&mut self, _block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+    fn infer_results(
+        &mut self,
+        _block: &Vec<Self::T>,
+        _write_keep_rate: f32,
+        _read_keep_rate: f32,
+    ) -> usize {
         // For this one dropping estimates is implemented elsewhere.
         0
     }
@@ -221,7 +226,12 @@ where
         }
     }
 
-    fn infer_results(&mut self, _block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+    fn infer_results(
+        &mut self,
+        _block: &Vec<Self::T>,
+        _write_keep_rate: f32,
+        _read_keep_rate: f32,
+    ) -> usize {
         // For this one dropping estimates is implemented elsewhere.
         0
     }
@@ -296,7 +306,12 @@ where
         }
     }
 
-    fn infer_results(&mut self, _block: &Vec<Self::T>, _write_keep_rate: f32) -> usize {
+    fn infer_results(
+        &mut self,
+        _block: &Vec<Self::T>,
+        _write_keep_rate: f32,
+        _read_keep_rate: f32,
+    ) -> usize {
         // For this one dropping estimates is implemented elsewhere.
         0
     }

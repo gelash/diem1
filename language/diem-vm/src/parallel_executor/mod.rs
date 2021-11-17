@@ -90,7 +90,7 @@ impl ParallelDiemVM {
             .collect();
         // println!("CLONE & Prologue {:?}", timer.elapsed());
 
-        analyzer.infer_results(&signature_verified_block, 1.0);
+        analyzer.infer_results(&signature_verified_block, 1.0, 1.0);
 
         let executor = ParallelTransactionExecutor::<
             PreprocessedTransaction,
@@ -133,6 +133,7 @@ impl ParallelDiemVM {
         transactions: Vec<Transaction>,
         state_view: &S,
         write_keep_rate: f32,
+        read_keep_rate: f32,
     ) -> (usize, usize) {
         let blockchain_view = RemoteStorage::new(state_view);
         let mut analyzer = ReadWriteSetAnalysisWrapper::new(analysis_result, &blockchain_view);
@@ -148,7 +149,8 @@ impl ParallelDiemVM {
             .collect();
         // println!("CLONE & Prologue {:?}", timer.elapsed());
 
-        let analysis_time = analyzer.infer_results(&signature_verified_block, write_keep_rate);
+        let analysis_time =
+            analyzer.infer_results(&signature_verified_block, write_keep_rate, read_keep_rate);
 
         let executor = ParallelTransactionExecutor::<
             PreprocessedTransaction,

@@ -46,7 +46,12 @@ impl<'a, S: MoveResolver + std::marker::Sync> ReadWriteSetInferencer
         })
     }
 
-    fn infer_results(&mut self, block: &Vec<Self::T>, write_keep_rate: f32) -> usize {
+    fn infer_results(
+        &mut self,
+        block: &Vec<Self::T>,
+        write_keep_rate: f32,
+        read_keep_rate: f32,
+    ) -> usize {
         let num_txns = block.len();
         let chunks_size = max(1, num_txns / num_cpus::get());
 
@@ -70,7 +75,9 @@ impl<'a, S: MoveResolver + std::marker::Sync> ReadWriteSetInferencer
         let mut rng = rand::thread_rng();
         for e in &mut estimates {
             e.keys_written
-                .retain(|_| rng.gen_range(0.0..10.0) / 10.0 <= write_keep_rate)
+                .retain(|_| rng.gen_range(0.0..10.0) / 10.0 <= write_keep_rate);
+            e.keys_read
+                .retain(|_| rng.gen_range(0.0..10.0) / 10.0 <= read_keep_rate);
         }
 
         self.results.lock().unwrap().replace(estimates);

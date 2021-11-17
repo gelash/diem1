@@ -272,7 +272,7 @@ where
                     let mut nothing_to_validate_cnt = 0;
                     let mut nothing_to_execute_cnt = 0;
 
-                    let mut validate = |version_to_validate: usize, o: bool| -> Option<usize> {
+                    let validate = |version_to_validate: usize, o: bool| -> Option<usize> {
                         let status_to_validate = scheduler.status(version_to_validate);
                         let mut ret = None;
 
@@ -419,25 +419,34 @@ where
                         let txn_to_execute = version_to_execute.unwrap();
                         let txn = &signature_verified_block[txn_to_execute];
 
-                        let state_view = MVHashMapView {
-                            map: &versioned_data_cache,
-                            version: txn_to_execute,
-                            scheduler: &scheduler,
-                            read_dependency: AtomicBool::new(false),
-                            reads: Arc::new(Mutex::new(Vec::new())),
-                        };
-
                         let txn_accesses = &infer_result[txn_to_execute];
 
-                        // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
-                        if txn_accesses.keys_read.iter().any(|k| {
-                            match versioned_data_cache.read(k, txn_to_execute) {
-                                Err(Some((dep_id, _))) => {
-                                    scheduler.add_dependency(txn_to_execute, dep_id)
+                        let exec_id = scheduler.exec_id(txn_to_execute);
+                        if exec_id & 2 == 1 {
+                            panic!("executed status while executing");
+                        }
+                        let has_dependency = if exec_id == 0 {
+                            txn_accesses.keys_read.iter().any(|k| {
+                                match versioned_data_cache.read(k, txn_to_execute) {
+                                    Err(Some((dep_id, _))) => {
+                                        scheduler.add_dependency(txn_to_execute, dep_id)
+                                    }
+                                    Ok(_) | Err(None) => false,
                                 }
-                                Ok(_) | Err(None) => false,
-                            }
-                        }) {
+                            })
+                        } else {
+                            scheduler.status(txn_to_execute).read_set().iter().any(|r| {
+                                match versioned_data_cache.read(r.path(), txn_to_execute) {
+                                    Err(Some((dep_id, _))) => {
+                                        scheduler.add_dependency(txn_to_execute, dep_id)
+                                    }
+                                    Ok(_) | Err(None) => false,
+                                }
+                            })
+                        };
+
+                        // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
+                        if has_dependency {
                             delay_execution_counter.fetch_add(1, Ordering::Relaxed);
 
                             local_checking_time += local_timer.elapsed();
@@ -445,6 +454,14 @@ where
 
                             continue;
                         }
+
+                        let state_view = MVHashMapView {
+                            map: &versioned_data_cache,
+                            version: txn_to_execute,
+                            scheduler: &scheduler,
+                            read_dependency: AtomicBool::new(false),
+                            reads: Arc::new(Mutex::new(Vec::new())),
+                        };
 
                         local_checking_time += local_timer.elapsed();
                         local_timer = Instant::now();
@@ -467,10 +484,6 @@ where
                         let original_estimates: HashSet<T::Key> =
                             txn_accesses.keys_written.iter().cloned().collect();
 
-                        let exec_id = scheduler.exec_id(txn_to_execute);
-                        if exec_id & 2 == 1 {
-                            panic!("executed status while executing");
-                        }
                         let mut prev_write_set: HashSet<T::Key> = if exec_id == 0 {
                             original_estimates.clone()
                         } else {
