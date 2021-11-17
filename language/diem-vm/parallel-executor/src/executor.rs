@@ -422,6 +422,11 @@ where
                         let txn_accesses = &infer_result[txn_to_execute];
 
                         let exec_id = scheduler.exec_id(txn_to_execute);
+                        let txn_status = if exec_id == 0 {
+                            None
+                        } else {
+                            Some(scheduler.status(txn_to_execute))
+                        };
                         if exec_id & 2 == 1 {
                             panic!("executed status while executing");
                         }
@@ -435,7 +440,7 @@ where
                                 }
                             })
                         } else {
-                            scheduler.status(txn_to_execute).read_set().iter().any(|r| {
+                            txn_status.as_ref().unwrap().read_set().iter().any(|r| {
                                 match versioned_data_cache.read(r.path(), txn_to_execute) {
                                     Err(Some((dep_id, _))) => {
                                         scheduler.add_dependency(txn_to_execute, dep_id)
@@ -487,8 +492,8 @@ where
                         let mut prev_write_set: HashSet<T::Key> = if exec_id == 0 {
                             original_estimates.clone()
                         } else {
-                            scheduler
-                                .status(txn_to_execute)
+                            txn_status
+                                .unwrap()
                                 .write_set()
                                 .iter()
                                 .map(|(k, _)| k.clone())
