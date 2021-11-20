@@ -1,14 +1,12 @@
 use std::cmp::min;
+use std::collections::HashMap;
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use crate::{
-    errors::Error,
-    task::{ExecutionStatus, Transaction, TransactionOutput},
-};
+use crate::{errors::Error, task::{ExecutionStatus, Transaction, TransactionOutput}};
 use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
-use mvhashmap::Version;
+use mvhashmap::{Version, WriteCell};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
@@ -44,7 +42,7 @@ impl<K> ReadDescriptor<K> {
 
 // Transaction status. When the transaction is first executed, new STMStatus
 // w. exec_id = 1 and the corresponding input/ouput is stored.
-pub struct STMStatus<K, T, E> {
+pub struct STMStatus<K, T, V, E> {
     // Unique identifier for each (re-)execution. Guaranteed to be add, with first execution
     // having exec_id = 1, second re-execution having exec_id = 3, etc.
     exec_id: usize,
@@ -54,9 +52,12 @@ pub struct STMStatus<K, T, E> {
     input: Vec<ReadDescriptor<K>>,
     // Can take once.
     output: RwLock<Option<ExecutionStatus<T, Error<E>>>>,
+
+    shortcuts: Arc<HashMap<K, Arc<WriteCell<V>>>>,
+
 }
 
-impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
+impl<K, T: TransactionOutput, V, E: Send + Clone> STMStatus<K, T, V, E> {
     pub fn exec_id(&self) -> usize {
         self.exec_id
     }
@@ -82,12 +83,20 @@ impl<K, T: TransactionOutput, E: Send + Clone> STMStatus<K, T, E> {
         return t.get_writes();
     }
 
+    pub fn shortcuts(&self) -> Arc<HashMap<K, Arc<WriteCell<V>>>>{
+        Arc::clone(&self.shortcuts)
+    }
+
+    // pub fn take_shortcuts(&self) -> HashMap<K, Arc<WriteCell<<<T as TransactionOutput>::T as Transaction>::Value>>>{
+    //     self.shortcuts.unwrap().take().unwrap() //maybe need a lock
+    // }
+
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
         self.output.write().unwrap().take().unwrap()
     }
 }
 
-pub struct Scheduler<K, T, E> {
+pub struct Scheduler<K, T, V, E> {
     // Shared index (version) of the next txn to be executed from the original transaction sequence.
     execution_marker: AtomicUsize,
     // Shared validation marker:
@@ -109,15 +118,17 @@ pub struct Scheduler<K, T, E> {
     stop_at_version: AtomicUsize,
     block_size: usize,
 
-    txn_buffer: SegQueue<usize>, // shared queue of list of dependency-resolved transactions.
-    txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>, // version -> txns that depend on it.
-    txn_status: Vec<CachePadded<ArcSwapOption<STMStatus<K, T, E>>>>, // version -> execution status.
+    txn_buffer: SegQueue<usize>,
+    // shared queue of list of dependency-resolved transactions.
+    txn_dependency: Vec<Arc<Mutex<Vec<usize>>>>,
+    // version -> txns that depend on it.
+    txn_status: Vec<CachePadded<ArcSwapOption<STMStatus<K, T, V, E>>>>, // version -> execution status.
 
     // Separately for perf.
     exec_ids: Vec<CachePadded<AtomicUsize>>,
 }
 
-impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
+impl<K, T: TransactionOutput, V,  E: Send + Clone> Scheduler<K, T, V, E> {
     pub fn new(num_txns: usize) -> Self {
         Self {
             execution_marker: AtomicUsize::new(0),
@@ -174,7 +185,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         }
     }
 
-    pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, E>>) -> bool {
+    pub fn abort(&self, version: usize, cur_status: &Arc<STMStatus<K, T, V, E>>) -> bool {
         if let Ok(_) = self.exec_ids[version].compare_exchange(
             cur_status.exec_id(),
             cur_status.exec_id() + 1,
@@ -238,7 +249,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         }
     }
 
-    pub fn status(&self, version: usize) -> Arc<STMStatus<K, T, E>> {
+    pub fn status(&self, version: usize) -> Arc<STMStatus<K, T, V, E>> {
         // TODO: Get rid of smart pointer clone, use load() and values maybe.
         self.txn_status[version].load_full().unwrap()
     }
@@ -306,6 +317,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         exec_id: usize,
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
+        shortcuts: HashMap<K, Arc<WriteCell<V>>>,
         revalidate_suffix: bool,
     ) {
         // Stores are safe because there is at most one execution at a time.
@@ -313,6 +325,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             exec_id: exec_id + 1,
             input,
             output: RwLock::new(Some(output)),
+            shortcuts: Arc::from(shortcuts),
         })));
         self.exec_ids[version].store(exec_id + 1, Ordering::SeqCst);
 

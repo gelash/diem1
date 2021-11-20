@@ -8,7 +8,7 @@ use crate::{
     task::{ExecutionStatus, ExecutorTask, ReadWriteSetInferencer, Transaction, TransactionOutput},
 };
 use anyhow::{bail, Result as AResult};
-use mvhashmap::{MVHashMap, Version};
+use mvhashmap::{MVHashMap, Version, WriteCell};
 use num_cpus;
 use rayon::{prelude::*, scope};
 use std::{
@@ -23,24 +23,27 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use std::collections::HashMap;
+use arc_swap::ArcSwapOption;
 
 pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
     version: Version,
-    scheduler: &'a Scheduler<K, T, E>,
+    scheduler: &'a Scheduler<K, T, V, E>,
     read_dependency: AtomicBool,
     reads: Arc<Mutex<Vec<ReadDescriptor<K>>>>,
+    // writes: Arc<Mutex<HashMap<K, Arc<WriteCell<V>>>>>,
 }
 
 const NOTHING_ITER_THRESHOLD: usize = 10000;
 
 impl<
-        'a,
-        K: PartialOrd + Send + Clone + Hash + Eq,
-        V: Clone + Send + Sync,
-        T: TransactionOutput,
-        E: Send + Clone,
-    > MVHashMapView<'a, K, V, T, E>
+    'a,
+    K: PartialOrd + Send + Clone + Hash + Eq + Sync,
+    V: Clone + Send + Sync,
+    T: TransactionOutput,
+    E: Send + Clone,
+> MVHashMapView<'a, K, V, T, E>
 {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
@@ -93,22 +96,23 @@ impl<
         exec_id: usize,
         data: Option<V>,
         original_estimates: &HashSet<K>,
-        prev_writes: &mut HashSet<K>,
+        prev_shortcuts: &mut HashMap<K, Arc<WriteCell<V>>>,
         writes_outside: &mut bool,
-    ) -> Result<(), Error<E>> {
-        if !prev_writes.remove(k) {
-            *writes_outside = true;
+    ) -> Result<Arc<WriteCell<V>>, Error<E>> {
+        if let Some(shortcut) = prev_shortcuts.remove(k) {
+            shortcut.write(data, exec_id);
+            return Ok(shortcut);
         }
+        *writes_outside = true;
 
         // Write estimated writes to static mvhashmap, and write non-estimated ones to dynamic mvhashmap
         if original_estimates.contains(k) {
-            self.map.write_to_static(k, version, exec_id, data).unwrap();
+            Ok(self.map.write_to_static(k, version, exec_id, data).unwrap())
         } else {
-            self.map
+            Ok(self.map
                 .write_to_dynamic(k, version, exec_id, data)
-                .unwrap();
+                .unwrap())
         }
-        Ok(())
     }
 
     pub fn mark_dirty(
@@ -153,10 +157,10 @@ pub struct ParallelTransactionExecutor<T: Transaction, E: ExecutorTask, I: ReadW
 }
 
 impl<T, E, I> ParallelTransactionExecutor<T, E, I>
-where
-    T: Transaction,
-    E: ExecutorTask<T = T>,
-    I: ReadWriteSetInferencer<T = T>,
+    where
+        T: Transaction,
+        E: ExecutorTask<T=T>,
+        I: ReadWriteSetInferencer<T=T>,
 {
     pub fn new(inferencer: I) -> Self {
         Self {
@@ -185,30 +189,87 @@ where
         // Get the read and write dependency for each transaction.
         let infer_result = self.inferencer.result(&signature_verified_block);
 
+
+        //TODO: make this parallel.
+        let mut op_shortcuts: Vec<Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)>> = Vec::new();
+        for accesses in infer_result.iter(){
+            let vec:Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)> = accesses
+                .keys_written
+                .clone()
+                .into_iter()
+                .map(|ap| (ap, ArcSwapOption::from(None)))
+                .collect();
+            op_shortcuts.push(vec);
+        }
+
+
+        // let op_shortcuts: Vec<Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)>> = infer_result
+        //     .par_iter()
+        //     //.enumerate()
+        //     .with_min_len(chunks_size)
+        //     .fold(Vec::new, |mut acc, accesses| {
+        //         acc.extend(
+        //             accesses
+        //                 .keys_written
+        //                 .clone()
+        //                 .into_iter()
+        //                 .map(|ap| (ap, ArcSwapOption::from(None))),
+        //         );
+        //         acc
+        //     })
+        //     .collect();
+
+        println!("op_shortcuts length = {}", op_shortcuts.len());
+        println!("infer_result length = {}", infer_result.len());
+
         // Use write analysis result to construct placeholders.
-        let path_version_tuples: Vec<(T::Key, usize)> = infer_result
+        let path_version_tuples: Vec<(T::Key, usize, usize)> = infer_result
             .par_iter()
             .enumerate()
             .with_min_len(chunks_size)
-            .fold(Vec::new, |mut acc, (idx, accesses)| {
-                acc.extend(
-                    accesses
-                        .keys_written
-                        .clone()
-                        .into_iter()
-                        .map(|ap| (ap, idx)),
-                );
+            .fold(Vec::new, |mut acc, (txn_idx, accesses)| {
+
+                let mut short_idx = 0;
+                for path in accesses.keys_written.clone(){
+                    acc.push((path, txn_idx, short_idx));
+                    short_idx += 1;
+                }
+                // acc.extend(
+                //     accesses
+                //         .keys_written
+                //         .clone()
+                //         .enumerate()
+                //         .into_iter()
+                //         .map(|(short_idx, ap)| (ap, txn_idx, short_idx)),
+                // );
                 acc
             })
             .flatten()
             .collect();
 
         let (versioned_data_cache, max_dependency_level) =
-            MVHashMap::new_from_parallel(path_version_tuples);
+            MVHashMap::new_from_parallel(path_version_tuples, &op_shortcuts);
 
-        // if max_dependency_level == 0 {
-        //     return Err(Error::InferencerError);
-        // }
+        let mut original_shortcuts: Vec<ArcSwapOption<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> = Vec::new();
+
+        for v in op_shortcuts{
+            let mut map = HashMap::new();
+            for (k, shortcut) in v{
+                map.insert(k, shortcut.swap(None).unwrap());
+            }
+            original_shortcuts.push(ArcSwapOption::from(Some(Arc::from(map))));
+        }
+        let original_shortcuts = original_shortcuts; //Amaizing code!
+        println!("original_shortcuts length = {}", original_shortcuts.len());
+
+        // let original_shortcuts: Vec<Option<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> = op_shortcuts
+        //     .par_iter()
+        //     .with_min_len(chunks_size)
+        //     .into_iter()
+        //     .map(|k, arc_swap_option| (k, Arc::from(arc_swap_option.load_full().unwrap())))
+        //     .collect()
+        //     .collect();
+
 
         let outcomes = OutcomeArray::new(num_txns);
 
@@ -293,14 +354,14 @@ where
                         // validating, all prior txn's must have been executed already).
                         let valid = versioned_data_cache.dynamic_empty()
                             || status_to_validate.read_set().iter().all(|r| {
-                                match state_view.read_map(r.path()) {
-                                    Ok((_, version, exec_id)) => {
-                                        r.validate(Some((version, exec_id)))
-                                    }
-                                    Err(Some(_)) => false, //dependency implies validation failure.
-                                    Err(None) => r.validate(None),
+                            match state_view.read_map(r.path()) {
+                                Ok((_, version, exec_id)) => {
+                                    r.validate(Some((version, exec_id)))
                                 }
-                            });
+                                Err(Some(_)) => false, //dependency implies validation failure.
+                                Err(None) => r.validate(None),
+                            }
+                        });
                         //local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -308,17 +369,21 @@ where
 
                             // Set dirty in both static and dynamic mvhashmaps.
                             //let write_timer = Instant::now();
-                            state_view.mark_dirty(
-                                version_to_validate,
-                                status_to_validate.exec_id(),
-                                &infer_result[version_to_validate]
-                                    .keys_written
-                                    .iter()
-                                    .cloned()
-                                    .collect(),
-                                &status_to_validate.write_set(),
-                            );
-                            //local_validation_write_time += write_timer.elapsed();
+
+                            for (_,cell) in status_to_validate.shortcuts().as_ref().into_iter(){
+                                cell.dirty();
+                            }
+
+                            // state_view.mark_dirty(
+                            //     version_to_validate,
+                            //     status_to_validate.exec_id(),
+                            //     &infer_result[version_to_validate]
+                            //         .keys_written
+                            //         .iter()
+                            //         .cloned()
+                            //         .collect(),
+                            //     &status_to_validate.write_set(),
+                            // );
 
                             ret = scheduler.schedule_txn(version_to_validate, self.num_cpus / 4, o);
 
@@ -466,6 +531,7 @@ where
                             scheduler: &scheduler,
                             read_dependency: AtomicBool::new(false),
                             reads: Arc::new(Mutex::new(Vec::new())),
+                            //writes: Arc::new(Mutex::new(HashMap::new())),
                         };
 
                         local_checking_time += local_timer.elapsed();
@@ -489,40 +555,68 @@ where
                         let original_estimates: HashSet<T::Key> =
                             txn_accesses.keys_written.iter().cloned().collect();
 
-                        let mut prev_write_set: HashSet<T::Key> = if exec_id == 0 {
-                            original_estimates.clone()
-                        } else {
-                            txn_status
-                                .unwrap()
-                                .write_set()
-                                .iter()
-                                .map(|(k, _)| k.clone())
-                                .collect()
-                        };
+                        //TODO: merge prev_write_set with shortcuts
+                        // let mut prev_write_set: HashSet<T::Key> = if exec_id == 0 {
+                        //     original_estimates.clone()
+                        // } else {
+                        //     txn_status
+                        //         .unwrap()
+                        //         .write_set()
+                        //         .iter()
+                        //         .map(|(k, _)| k.clone())
+                        //         .collect()
+                        // };
+
+
                         // prev write set has already been marked dirty! similarly,
                         // the estimates are marked as Unassigned. So future transactions
                         // only need revalidation when there is a write outside of the
                         // prev_write_set.
+
                         let mut writes_outside = false;
+                        let arc_prev_shortcuts: Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>> = if exec_id == 0 {
+                            original_shortcuts[txn_to_execute].load_full().unwrap()
+                        } else {
+                            txn_status.unwrap().shortcuts()
+                        };
+                        let mut new_shortcuts: HashMap<T::Key, Arc<WriteCell<T::Value>>> = HashMap::new();
+                        //TODO save the clone.
+                        let mut prev_shortcuts= (&*arc_prev_shortcuts).clone();
+
+                        let mut write = |k: T::Key, v: T::Value| -> bool {
+                            // if let Some(shortcut) = shortcuts.get(k) {
+                            //     shortcut.write(Some(v), exec_id);
+                            //     true
+                            // } else {
+                            if let Ok(shortcut) = state_view
+                                .write(
+                                    &k,
+                                    txn_to_execute,
+                                    exec_id,
+                                    Some(v),
+                                    &original_estimates,
+                                    &mut prev_shortcuts,
+                                    &mut writes_outside,
+                                ) {
+                                new_shortcuts.insert(k, shortcut);
+                                true
+                            } else {
+                                false
+                            }
+                        //}
+                        };
 
                         let commit_result = match execute_result {
                             ExecutionStatus::Success(output) => {
+                                //TODO: first check shortcuts. Otherwise set write_outside and the code below
+
                                 // Commit the side effects to the versioned_data_cache.
                                 if output.get_writes().into_iter().all(|(k, v)| {
-                                    state_view
-                                        .write(
-                                            &k,
-                                            txn_to_execute,
-                                            exec_id,
-                                            Some(v),
-                                            &original_estimates,
-                                            &mut prev_write_set,
-                                            &mut writes_outside,
-                                        )
-                                        .is_ok()
+                                    write(k, v)
                                 }) {
                                     ExecutionStatus::Success(output)
                                 } else {
+                                    //TODO: the error below is not relevant anymore.
                                     // Failed to write to the versioned data cache as
                                     // transaction write to a key that wasn't estimated by the
                                     // inferencer, aborting the entire execution.
@@ -532,17 +626,7 @@ where
                             ExecutionStatus::SkipRest(output) => {
                                 // Commit and skip the rest of the transactions.
                                 if output.get_writes().into_iter().all(|(k, v)| {
-                                    state_view
-                                        .write(
-                                            &k,
-                                            txn_to_execute,
-                                            exec_id,
-                                            Some(v),
-                                            &original_estimates,
-                                            &mut prev_write_set,
-                                            &mut writes_outside,
-                                        )
-                                        .is_ok()
+                                    write(k, v)
                                 }) {
                                     scheduler.set_stop_version(txn_to_execute + 1);
                                     ExecutionStatus::SkipRest(output)
@@ -560,13 +644,18 @@ where
                             }
                         };
 
-                        state_view.skip(txn_to_execute, prev_write_set, original_estimates);
+                        for (_, shortcut) in prev_shortcuts.iter() {
+                            shortcut.skip();
+                        }
+
+                        //state_view.skip(txn_to_execute, prev_shortcuts, original_estimates);
 
                         scheduler.finish_execution(
                             txn_to_execute,
                             exec_id,
                             state_view.drain_reads(),
                             commit_result,
+                            new_shortcuts,
                             writes_outside,
                         );
                         local_apply_write_time += local_timer.elapsed();

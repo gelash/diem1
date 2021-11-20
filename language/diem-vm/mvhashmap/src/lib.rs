@@ -1,7 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use std::{
     cmp::{max, PartialOrd},
@@ -42,7 +42,7 @@ pub enum Error {
 }
 
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
-pub(crate) struct WriteCell<V> {
+pub struct WriteCell<V> {
     flag: AtomicUsize,
     retry_num: AtomicUsize,
     data: ArcSwap<Option<V>>,
@@ -72,23 +72,21 @@ impl<V> WriteCell<V> {
     }
 
     pub fn skip(&self) {
-        // TODO: remove, for debugging purposes.
-        // let prev = self.flag.load(Ordering::SeqCst);
-        // if prev == FLAG_SKIP || prev == FLAG_DONE {
-        // panic!();
-        // }
-
         self.flag.store(FLAG_SKIP, Ordering::SeqCst);
+    }
+
+    pub fn dirty(&self) {
+        self.flag.store(FLAG_DIRTY, Ordering::SeqCst);
     }
 }
 
 pub struct StaticMVHashMap<K, V> {
-    data: HashMap<K, BTreeMap<Version, WriteCell<V>>>,
+    data: HashMap<K, BTreeMap<Version, Arc<WriteCell<V>>>>,
 }
 
 pub struct DynamicMVHashMap<K, V> {
     empty: AtomicUsize,
-    data: Arc<DashMap<K, BTreeMap<Version, WriteCell<V>>>>,
+    data: Arc<DashMap<K, BTreeMap<Version, Arc<WriteCell<V>>>>>,
 }
 
 pub struct MVHashMap<K, V> {
@@ -96,10 +94,10 @@ pub struct MVHashMap<K, V> {
     d_mvhashmap: DynamicMVHashMap<K, V>,
 }
 
-impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap<K, V> {
-    pub fn new_from_parallel(possible_writes: Vec<(K, Version)>) -> (MVHashMap<K, V>, usize) {
+impl<K: PartialOrd + Send + Clone + Hash + Eq + Sync, V: Clone + Sync + Send> MVHashMap<K, V> {
+    pub fn new_from_parallel(possible_writes: Vec<(K, usize, usize)>, op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>) -> (MVHashMap<K, V>, usize) {
         let (s_mvhashmap, max_dependency_length) =
-            StaticMVHashMap::new_from_parallel(possible_writes);
+            StaticMVHashMap::new_from_parallel(possible_writes, op_shortcuts);
         let d_mvhashmap = DynamicMVHashMap::new();
         (
             MVHashMap {
@@ -175,7 +173,7 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<(), Error> {
+    ) -> Result<Arc<WriteCell<V>>, Error> {
         self.s_mvhashmap.write(key, version, retry_num, data)
     }
 
@@ -185,7 +183,7 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq, V: Clone + Sync + Send> MVHashMap
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<(), ()> {
+    ) -> Result<Arc<WriteCell<V>>, ()> {
         self.d_mvhashmap.write(key, version, retry_num, data)
     }
 
@@ -228,12 +226,12 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
     ///
     /// Returns the MVHashMap, and the maximum number of writes that can write to one single key.
     pub fn new_from(possible_writes: Vec<(K, Version)>) -> (Self, usize) {
-        let mut outer_map: HashMap<K, BTreeMap<Version, WriteCell<V>>> = HashMap::new();
+        let mut outer_map: HashMap<K, BTreeMap<Version, Arc<WriteCell<V>>>> = HashMap::new();
         for (key, version) in possible_writes.into_iter() {
             outer_map
                 .entry(key)
                 .or_default()
-                .insert(version, WriteCell::new());
+                .insert(version, Arc::from(WriteCell::new()));
         }
         let max_dependency_size = outer_map
             .values()
@@ -247,7 +245,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         self.data.len()
     }
 
-    fn get_entry(&self, key: &K, version: Version) -> Result<&WriteCell<V>, Error> {
+    fn get_entry(&self, key: &K, version: Version) -> Result<&Arc<WriteCell<V>>, Error> {
         self.data
             .get(key)
             .ok_or(Error::UnexpectedWrite)?
@@ -263,7 +261,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<(), Error> {
+    ) -> Result<Arc<WriteCell<V>>, Error> {
         // By construction there will only be a single writer, before the
         // write there will be no readers on the variable.
         // So it is safe to go ahead and write without any further check.
@@ -272,7 +270,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 
         entry.write(data, retry_num);
 
-        Ok(())
+        Ok(Arc::clone(entry))
     }
 
     /// Skips writing to `key` at `version`.
@@ -353,21 +351,25 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 const PARALLEL_THRESHOLD: usize = 1000;
 
 impl<K, V> StaticMVHashMap<K, V>
-where
-    K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Send + Sync,
+    where
+        K: PartialOrd + Send + Clone + Hash + Eq + Sync,
+        V: Send + Sync,
 {
     fn split_merge(
         num_cpus: usize,
         recursion_depth: usize,
-        split: Vec<(K, Version)>,
-    ) -> (usize, HashMap<K, BTreeMap<Version, WriteCell<V>>>) {
+        split: Vec<(K, Version, usize)>,
+        op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>,
+    ) -> (usize, HashMap<K, BTreeMap<Version, Arc<WriteCell<V>>>>) {
         if (1 << recursion_depth) > num_cpus || split.len() < PARALLEL_THRESHOLD {
             let mut data = HashMap::new();
             let mut max_len = 0;
-            for (path, version) in split.into_iter() {
+            for (path, version, short_idx) in split.into_iter() {
                 let place = data.entry(path).or_insert_with(BTreeMap::new);
-                place.insert(version, WriteCell::new());
+                let cell = Arc::from(WriteCell::new());
+                place.insert(version, Arc::clone(&cell));
+                //assert!(op_shortcuts[version][short_idx].0 == path);
+                op_shortcuts[version][short_idx].1.swap(Some(cell));
                 max_len = max(max_len, place.len());
             }
             (max_len, data)
@@ -375,10 +377,10 @@ where
             // Partition the possible writes by keys and work on each partition in parallel.
             let pivot_address = split[split.len() / 2].0.clone();
             let (left, right): (Vec<_>, Vec<_>) =
-                split.into_iter().partition(|(p, _)| *p < pivot_address);
+                split.into_iter().partition(|(p, _, _)| *p < pivot_address);
             let ((m0, mut left_map), (m1, right_map)) = rayon::join(
-                || Self::split_merge(num_cpus, recursion_depth + 1, left),
-                || Self::split_merge(num_cpus, recursion_depth + 1, right),
+                || Self::split_merge(num_cpus, recursion_depth + 1, left, op_shortcuts),
+                || Self::split_merge(num_cpus, recursion_depth + 1, right, op_shortcuts),
             );
             left_map.extend(right_map);
             (max(m0, m1), left_map)
@@ -386,10 +388,10 @@ where
     }
 
     /// Create the MVHashMap structure from a list of possible writes in parallel.
-    pub fn new_from_parallel(possible_writes: Vec<(K, Version)>) -> (Self, usize) {
+    pub fn new_from_parallel(possible_writes: Vec<(K, usize, usize)>, op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>) -> (Self, usize) {
         let num_cpus = num_cpus::get();
 
-        let (max_dependency_len, data) = Self::split_merge(num_cpus, 0, possible_writes);
+        let (max_dependency_len, data) = Self::split_merge(num_cpus, 0, possible_writes, op_shortcuts);
         (StaticMVHashMap { data }, max_dependency_len)
     }
 }
@@ -408,21 +410,22 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<(), ()> {
+    ) -> Result<Arc<WriteCell<V>>, ()> {
         if self.empty.load(Ordering::SeqCst) == 1 {
             self.empty.store(0, Ordering::SeqCst);
         }
+        let ret = Arc::from(WriteCell::new_from(FLAG_DONE, retry_num, data));
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(version, WriteCell::new_from(FLAG_DONE, retry_num, data));
+        map.insert(version, Arc::clone(&ret));
 
-        Ok(())
+        Ok(ret)
     }
 
     pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) {
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
 
         // TODO: just update the entry. Later even with shortcut (and no need for wlock).
-        map.insert(version, WriteCell::new_from(FLAG_DIRTY, retry_num, None));
+        map.insert(version, Arc::from(WriteCell::new_from(FLAG_DIRTY, retry_num, None)));
     }
 
     pub fn skip(&self, key: &K, version: Version) {
