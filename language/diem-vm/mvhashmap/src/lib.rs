@@ -453,6 +453,15 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
                     // if *entry_key < version {
                     let flag = entry_val.flag.load(Ordering::SeqCst);
 
+
+                    if flag == FLAG_DONE {
+                        return Ok((
+                            (**entry_val.data.load()).clone(),
+                            *entry_key,
+                            entry_val.retry_num.load(Ordering::SeqCst),
+                        ));
+                    }
+
                     if flag == FLAG_DIRTY {
                         return Err(Some((
                             *entry_key,
@@ -461,13 +470,12 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
                     }
 
                     // The entry is populated so return its contents
-                    if flag == FLAG_DONE {
-                        return Ok((
-                            (**entry_val.data.load()).clone(),
-                            *entry_key,
-                            entry_val.retry_num.load(Ordering::SeqCst),
-                        ));
+
+
+                    if flag == FLAG_SKIP {
+                        continue;
                     }
+
 
                     unreachable!();
                     // }

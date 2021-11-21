@@ -219,8 +219,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         //     })
         //     .collect();
 
-        println!("op_shortcuts length = {}", op_shortcuts.len());
-        println!("infer_result length = {}", infer_result.len());
 
         // Use write analysis result to construct placeholders.
         let path_version_tuples: Vec<(T::Key, usize, usize)> = infer_result
@@ -260,7 +258,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
             original_shortcuts.push(ArcSwapOption::from(Some(Arc::from(map))));
         }
         let original_shortcuts = original_shortcuts; //Amaizing code!
-        println!("original_shortcuts length = {}", original_shortcuts.len());
 
         // let original_shortcuts: Vec<Option<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> = op_shortcuts
         //     .par_iter()
