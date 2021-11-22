@@ -212,7 +212,8 @@ where
 
         let outcomes = OutcomeArray::new(num_txns);
 
-        let scheduler = Scheduler::new(num_txns);
+        let compute_cpus = self.num_cpus;
+        let scheduler = Scheduler::new(num_txns, compute_cpus);
 
         let delay_execution_counter = AtomicUsize::new(0);
         let abort_counter = AtomicUsize::new(0);
@@ -239,7 +240,6 @@ where
         timer = Instant::now();
 
         let id_gen = AtomicUsize::new(0);
-        let compute_cpus = self.num_cpus;
         let validator_workers = AtomicUsize::new(compute_cpus / 4);
         let max_validator_workers = compute_cpus / 2;
 
@@ -324,7 +324,7 @@ where
 
                             abort_counter.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            scheduler.finish_validation();
+                            scheduler.finish_validation(id);
                         }
 
                         ret
@@ -347,7 +347,7 @@ where
                         // First check if any txn can be validated
                         let num_validators = validator_workers.load(Ordering::Relaxed);
                         if id < num_validators {
-                            if let Some(version_to_validate) = scheduler.next_txn_to_validate() {
+                            if let Some(version_to_validate) = scheduler.next_txn_to_validate(id) {
                                 local_other_time += other_timer.elapsed();
 
                                 local_timer = Instant::now();
@@ -385,7 +385,7 @@ where
                         }
 
                         if version_to_execute.is_none() {
-                            version_to_execute = scheduler.next_txn_to_execute();
+                            version_to_execute = scheduler.next_txn_to_execute(id);
                         }
 
                         if version_to_execute.is_none() {
@@ -568,6 +568,7 @@ where
                             state_view.drain_reads(),
                             commit_result,
                             writes_outside,
+                            id,
                         );
                         local_apply_write_time += local_timer.elapsed();
                         local_timer = Instant::now();

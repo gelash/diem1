@@ -3,12 +3,12 @@ use std::cmp::min;
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     errors::Error,
+    snazzy::Snazzy,
     task::{ExecutionStatus, Transaction, TransactionOutput},
 };
 use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
-use mvhashmap::Version;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
@@ -97,7 +97,7 @@ pub struct Scheduler<K, T, E> {
     // Stores number of threads that are currently validating. Used in combination with validation
     // marker to decide when it's safe to complete computation (can commit everything). TODO: a per-thread
     // counter would generalize to detect what prefix can be committed.
-    num_active_tasks: AtomicUsize,
+    num_active_tasks: Snazzy,
     // Shared marker that's set when a thread detects all txns can be committed - so
     // other threads can immediately know without expensive checks.
     done_marker: AtomicUsize,
@@ -118,11 +118,12 @@ pub struct Scheduler<K, T, E> {
 }
 
 impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
-    pub fn new(num_txns: usize) -> Self {
+    pub fn new(num_txns: usize, num_threads: usize) -> Self {
         Self {
             execution_marker: AtomicUsize::new(0),
             validation_marker: AtomicU64::new(0),
-            num_active_tasks: AtomicUsize::new(num_txns),
+            num_active_tasks: Snazzy::new(num_txns, num_threads, vec![vec![8; 2]; 1]),
+            // num_active_tasks: Snazzy::new(num_txns, num_threads, Vec::new()),
             done_marker: AtomicUsize::new(0),
             execution_marker_done: AtomicUsize::new(0),
             stop_at_version: AtomicUsize::new(num_txns),
@@ -191,7 +192,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     }
 
     // Return the next txn version & status for the thread to validate.
-    pub fn next_txn_to_validate(&self) -> Option<usize> {
+    pub fn next_txn_to_validate(&self, thread_id: usize) -> Option<usize> {
         // Read val_marker, seq cst ordered for check_done.
         let mut val_marker = self.validation_marker.load(Ordering::SeqCst);
 
@@ -207,7 +208,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
             let new_marker = ((next_to_val as u64 + 1) << 32) | num_decrease;
 
             // Mark that thread is validating next_to_val, else early abort possible.
-            self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+            self.num_active_tasks.increment(thread_id);
 
             // CAS to win the competition to actually validate next_to_val.
             match self.validation_marker.compare_exchange_weak(
@@ -222,7 +223,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                     let exec_id_watermark = self.exec_id(next_to_val);
                     if (exec_id_watermark & 1) == 0 {
                         // Even watermark means awating (re-)execution, not ready to validate.
-                        self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                        self.num_active_tasks.decrement(thread_id);
                         return None;
                     }
 
@@ -231,7 +232,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 }
                 Err(x) => {
                     // CAS unsuccessful - not validating next_to_val (will try different index).
-                    self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                    self.num_active_tasks.decrement(thread_id);
                     val_marker = x;
                 }
             }
@@ -246,7 +247,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     // Return the next txn id for the thread to execute: first fetch from the shared queue that
     // stores dependency-resolved txns, then fetch from the original ordered txn sequence.
     // Return Some(id) if found the next transaction, else return None.
-    pub fn next_txn_to_execute(&self) -> Option<Version> {
+    pub fn next_txn_to_execute(&self, thread_id: usize) -> Option<usize> {
         // Fetch txn from txn_buffer
         if self.txn_buffer.is_empty() {
             // Fetch the first non-executed txn from the original transaction list
@@ -255,17 +256,17 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
                 return None;
             }
 
-            //self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+            self.num_active_tasks.increment_snazzy(thread_id);
             let next_to_execute = self.execution_marker.fetch_add(1, Ordering::Relaxed);
             if next_to_execute < self.num_txn_to_execute() {
                 Some(next_to_execute)
             } else if next_to_execute < self.block_size {
-                self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                self.num_active_tasks.decrement(thread_id);
                 None
             } else {
                 // Everything executed at least once - validation will take care of rest.
                 self.execution_marker_done.store(1, Ordering::Relaxed);
-                //self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                self.num_active_tasks.decrement_snazzy(thread_id);
                 None
             }
         } else if let Some(version) = self.txn_buffer.pop() {
@@ -277,7 +278,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
     // Invoked when txn depends on another txn, adds version to the dependency list the other txn.
     // Return true if successful, otherwise dependency resolved in the meantime, return false.
-    pub fn add_dependency(&self, version: Version, dep_version: Version) -> bool {
+    pub fn add_dependency(&self, version: usize, dep_version: usize) -> bool {
         // Could pre-check that the txn isn't in executed state, but shouldn't matter much since
         // the caller usually has just observed the read dependency (so not executed state).
 
@@ -307,6 +308,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
         revalidate_suffix: bool,
+        thread_id: usize,
     ) {
         // Stores are safe because there is at most one execution at a time.
         self.txn_status[version].store(Some(Arc::new(STMStatus {
@@ -330,13 +332,13 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
         if revalidate_suffix {
             self.decrease_validation_marker(version);
-            self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+            self.num_active_tasks.decrement(thread_id);
         }
     }
 
     // Returns true if there are no active validators left.
-    pub fn finish_validation(&self) {
-        self.num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+    pub fn finish_validation(&self, thread_id: usize) {
+        self.num_active_tasks.decrement(thread_id);
     }
 
     pub fn schedule_txn(
@@ -345,8 +347,6 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
         buffer_threshold: usize,
         share_override: bool,
     ) -> Option<usize> {
-        // self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
-
         if !share_override && self.txn_buffer.len() > buffer_threshold {
             Some(version)
         } else {
@@ -357,13 +357,13 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
 
     // Reset the txn version/id to end execution earlier. The executor will stop at the smallest
     // `stop_version` when there are multiple concurrent invocation.
-    pub fn set_stop_version(&self, stop_version: Version) {
+    pub fn set_stop_version(&self, stop_version: usize) {
         self.stop_at_version
             .fetch_min(stop_version, Ordering::Relaxed);
     }
 
     // Get the last txn version/id
-    pub fn num_txn_to_execute(&self) -> Version {
+    pub fn num_txn_to_execute(&self) -> usize {
         self.stop_at_version.load(Ordering::Relaxed)
     }
 
@@ -375,7 +375,7 @@ impl<K, T: TransactionOutput, E: Send + Clone> Scheduler<K, T, E> {
     fn check_done(&self, val_marker: u64, num_txns: usize) {
         let val_version = (val_marker >> 32) as usize;
 
-        if val_version < num_txns || self.num_active_tasks.load(Ordering::SeqCst) > 0 {
+        if val_version < num_txns || !self.num_active_tasks.zero() {
             // There are txns to validate.
             return;
         }
