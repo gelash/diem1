@@ -209,15 +209,18 @@ impl InnerSnazzy {
         }
     }
 
-    fn snazzify(&self, tree: &SnazzyTree, target: usize) {
+    fn snazzify<const ODD: bool>(&self, tree: &SnazzyTree, target: usize) {
         let mut seq_id = self.max_seq_id.load(Ordering::SeqCst);
         loop {
-            if seq_id >= target {
-                if seq_id > target && target & 1 == 1 {
+            if seq_id > target {
+                if ODD {
+                    // target is odd. TODO: assert.
                     // op increased but has to decrease itself.
                     tree.decrement_node(tree.parent(self.store_idx));
                 }
-                break;
+            }
+            if seq_id >= target {
+                return;
             }
 
             let cur_target = min(target, seq_id + 2 - (seq_id & 1));
@@ -245,7 +248,7 @@ impl InnerSnazzy {
         if zero {
             tree.increment_node(tree.parent(self.store_idx));
 
-            self.snazzify(tree, seq_id);
+            self.snazzify::<true>(tree, seq_id);
         }
     }
 
@@ -253,7 +256,7 @@ impl InnerSnazzy {
         match self.decrement_counter() {
             Some((one, seq_id)) => {
                 if one {
-                    self.snazzify(tree, seq_id);
+                    self.snazzify::<false>(tree, seq_id);
                 }
             }
             None => {
