@@ -9,7 +9,7 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
-use mvhashmap::{Version, WriteCell};
+use mvhashmap::{Version, WriteCellPtr};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
@@ -56,7 +56,7 @@ pub struct STMStatus<K, T, V, E> {
     // Can take once.
     output: RwLock<Option<ExecutionStatus<T, Error<E>>>>,
 
-    shortcuts: ArcSwapOption<HashMap<K, Arc<WriteCell<V>>>>,
+    shortcuts: ArcSwapOption<HashMap<K, WriteCellPtr<V>>>,
 }
 
 impl<K, T: TransactionOutput, V, E: Send + Clone> STMStatus<K, T, V, E> {
@@ -78,7 +78,7 @@ impl<K, T: TransactionOutput, V, E: Send + Clone> STMStatus<K, T, V, E> {
             .for_each(|(_, cell)| cell.mark_dirty());
     }
 
-    pub fn take_shortcuts(&self) -> Arc<HashMap<K, Arc<WriteCell<V>>>> {
+    pub fn take_shortcuts(&self) -> Arc<HashMap<K, WriteCellPtr<V>>> {
         self.shortcuts.swap(None).unwrap()
     }
 
@@ -308,7 +308,7 @@ impl<K, T: TransactionOutput, V, E: Send + Clone> Scheduler<K, T, V, E> {
         exec_id: usize,
         input: Vec<ReadDescriptor<K>>,
         output: ExecutionStatus<T, Error<E>>,
-        shortcuts: HashMap<K, Arc<WriteCell<V>>>,
+        shortcuts: HashMap<K, WriteCellPtr<V>>,
         revalidate_suffix: bool,
     ) {
         // Stores are safe because there is at most one execution at a time.

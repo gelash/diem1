@@ -80,6 +80,35 @@ impl<V> WriteCell<V> {
     }
 }
 
+pub struct WriteCellPtr<V>(*const WriteCell<V>);
+
+unsafe impl<V> Sync for WriteCellPtr<V> {}
+unsafe impl<V> Send for WriteCellPtr<V> {}
+
+impl<V> WriteCellPtr<V> {
+    pub fn new(cell: *const WriteCell<V>) -> Self {
+        Self(cell)
+    }
+
+    pub fn write(&self, v: Option<V>, retry_num: usize) {
+        unsafe {
+            self.0.as_ref().unwrap().write(v, retry_num);
+        }
+    }
+
+    pub fn skip(&self) {
+        unsafe {
+            self.0.as_ref().unwrap().skip();
+        }
+    }
+
+    pub fn mark_dirty(&self) {
+        unsafe {
+            self.0.as_ref().unwrap().mark_dirty();
+        }
+    }
+}
+
 pub struct StaticMVHashMap<K, V> {
     data: HashMap<K, BTreeMap<Version, Arc<WriteCell<V>>>>,
 }
@@ -176,7 +205,7 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq + Sync, V: Clone + Sync + Send> MV
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<Arc<WriteCell<V>>, Error> {
+    ) -> Result<WriteCellPtr<V>, Error> {
         self.s_mvhashmap.write(key, version, retry_num, data)
     }
 
@@ -186,7 +215,7 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq + Sync, V: Clone + Sync + Send> MV
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<Arc<WriteCell<V>>, ()> {
+    ) -> Result<WriteCellPtr<V>, ()> {
         self.d_mvhashmap.write(key, version, retry_num, data)
     }
 
@@ -251,7 +280,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<Arc<WriteCell<V>>, Error> {
+    ) -> Result<WriteCellPtr<V>, Error> {
         // By construction there will only be a single writer, before the
         // write there will be no readers on the variable.
         // So it is safe to go ahead and write without any further check.
@@ -260,7 +289,7 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 
         entry.write(data, retry_num);
 
-        Ok(Arc::clone(entry))
+        Ok(WriteCellPtr(Arc::as_ptr(&entry)))
     }
 
     /// Skips writing to `key` at `version`.
@@ -395,15 +424,16 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
         version: Version,
         retry_num: usize,
         data: Option<V>,
-    ) -> Result<Arc<WriteCell<V>>, ()> {
+    ) -> Result<WriteCellPtr<V>, ()> {
         if self.empty.load(Ordering::SeqCst) == 1 {
             self.empty.store(0, Ordering::SeqCst);
         }
         let ret = Arc::from(WriteCell::new_from(FLAG_DONE, retry_num, data));
+        let ret_ptr = WriteCellPtr(Arc::as_ptr(&ret));
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-        map.insert(version, Arc::clone(&ret));
+        map.insert(version, ret);
 
-        Ok(ret)
+        Ok(ret_ptr)
     }
 
     pub fn skip(&self, key: &K, version: Version) {

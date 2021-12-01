@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Result as AResult};
 use arc_swap::ArcSwapOption;
-use mvhashmap::{MVHashMap, Version, WriteCell};
+use mvhashmap::{MVHashMap, Version, WriteCell, WriteCellPtr};
 use num_cpus;
 use rayon::{prelude::*, scope};
 use std::collections::HashMap;
@@ -96,9 +96,9 @@ impl<
         exec_id: usize,
         data: Option<V>,
         original_estimates: &HashSet<K>,
-        prev_shortcuts: &mut HashMap<K, Arc<WriteCell<V>>>,
+        prev_shortcuts: &mut HashMap<K, WriteCellPtr<V>>,
         writes_outside: &mut bool,
-    ) -> Result<Arc<WriteCell<V>>, Error<E>> {
+    ) -> Result<WriteCellPtr<V>, Error<E>> {
         if let Some(shortcut) = prev_shortcuts.remove(k) {
             shortcut.write(data, exec_id);
             return Ok(shortcut);
@@ -229,20 +229,20 @@ where
         let (versioned_data_cache, max_dependency_level) =
             MVHashMap::new_from_parallel(path_version_tuples, &op_shortcuts);
 
-        let mut original_shortcuts: Vec<ArcSwapOption<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> =
+        let mut original_shortcuts: Vec<ArcSwapOption<HashMap<T::Key, WriteCellPtr<T::Value>>>> =
             Vec::new();
-        // let mut original_shortcuts: Vec<Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> =
-        // Vec::new();
 
         for v in op_shortcuts {
             let mut map = HashMap::new();
             for (k, shortcut) in v {
-                map.insert(k, shortcut.swap(None).unwrap());
+                map.insert(
+                    k,
+                    WriteCellPtr::new(Arc::as_ptr(&shortcut.swap(None).unwrap())),
+                );
             }
             original_shortcuts.push(ArcSwapOption::from(Some(Arc::from(map))));
-            // original_shortcuts.push(Arc::from(map));
         }
-        let original_shortcuts = original_shortcuts; //Amaizing code!
+        let original_shortcuts = original_shortcuts; //Amazing code!
 
         // let original_shortcuts: Vec<Option<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> = op_shortcuts
         //     .par_iter()
@@ -545,7 +545,7 @@ where
 
                         let mut writes_outside = false;
 
-                        let arc_prev_shortcuts: Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>> =
+                        let arc_prev_shortcuts: Arc<HashMap<T::Key, WriteCellPtr<T::Value>>> =
                         // let mut prev_shortcuts: &mut HashMap<T::Key, Arc<WriteCell<T::Value>>> =
                             if exec_id == 0 {
                                 original_shortcuts[txn_to_execute].swap(None).unwrap()
@@ -561,7 +561,7 @@ where
                             unreachable!();
                         };
 
-                        let mut new_shortcuts: HashMap<T::Key, Arc<WriteCell<T::Value>>> =
+                        let mut new_shortcuts: HashMap<T::Key, WriteCellPtr<T::Value>> =
                             HashMap::new();
                         //TODO save the clone.
                         // let mut prev_shortcuts = (*arc_prev_shortcuts).clone();
