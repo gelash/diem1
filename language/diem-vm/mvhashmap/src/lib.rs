@@ -75,7 +75,7 @@ impl<V> WriteCell<V> {
         self.flag.store(FLAG_SKIP, Ordering::SeqCst);
     }
 
-    pub fn dirty(&self) {
+    pub fn mark_dirty(&self) {
         self.flag.store(FLAG_DIRTY, Ordering::SeqCst);
     }
 }
@@ -95,7 +95,10 @@ pub struct MVHashMap<K, V> {
 }
 
 impl<K: PartialOrd + Send + Clone + Hash + Eq + Sync, V: Clone + Sync + Send> MVHashMap<K, V> {
-    pub fn new_from_parallel(possible_writes: Vec<(K, usize, usize)>, op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>) -> (MVHashMap<K, V>, usize) {
+    pub fn new_from_parallel(
+        possible_writes: Vec<(K, usize, usize)>,
+        op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>,
+    ) -> (MVHashMap<K, V>, usize) {
         let (s_mvhashmap, max_dependency_length) =
             StaticMVHashMap::new_from_parallel(possible_writes, op_shortcuts);
         let d_mvhashmap = DynamicMVHashMap::new();
@@ -187,19 +190,6 @@ impl<K: PartialOrd + Send + Clone + Hash + Eq + Sync, V: Clone + Sync + Send> MV
         self.d_mvhashmap.write(key, version, retry_num, data)
     }
 
-    pub fn set_dirty_to_static(
-        &self,
-        key: &K,
-        version: Version,
-        retry_num: usize,
-    ) -> Result<(), Error> {
-        self.s_mvhashmap.set_dirty(key, version, retry_num)
-    }
-
-    pub fn set_dirty_to_dynamic(&self, key: &K, version: Version, retry_num: usize) {
-        self.d_mvhashmap.set_dirty(key, version, retry_num)
-    }
-
     pub fn dynamic_empty(&self) -> bool {
         self.d_mvhashmap.empty()
     }
@@ -283,15 +273,6 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
         Ok(())
     }
 
-    pub fn set_dirty(&self, key: &K, version: Version, _retry_num: usize) -> Result<(), Error> {
-        let entry = self.get_entry(key, version)?;
-
-        entry.flag.store(FLAG_DIRTY, Ordering::SeqCst);
-        // TODO: maybe assert retry number is the same.
-        // entry.retry_num.store(retry_num, Ordering::SeqCst);
-        Ok(())
-    }
-
     /// Get the value of `key` at `version`.
     /// Returns Ok(val) if such key is already assigned by previous transactions.
     /// Returns Err(None) if `version` is smaller than the write of all previous versions.
@@ -351,9 +332,9 @@ impl<K: Hash + Clone + Eq, V: Clone> StaticMVHashMap<K, V> {
 const PARALLEL_THRESHOLD: usize = 1000;
 
 impl<K, V> StaticMVHashMap<K, V>
-    where
-        K: PartialOrd + Send + Clone + Hash + Eq + Sync,
-        V: Send + Sync,
+where
+    K: PartialOrd + Send + Clone + Hash + Eq + Sync,
+    V: Send + Sync,
 {
     fn split_merge(
         num_cpus: usize,
@@ -388,10 +369,14 @@ impl<K, V> StaticMVHashMap<K, V>
     }
 
     /// Create the MVHashMap structure from a list of possible writes in parallel.
-    pub fn new_from_parallel(possible_writes: Vec<(K, usize, usize)>, op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>) -> (Self, usize) {
+    pub fn new_from_parallel(
+        possible_writes: Vec<(K, usize, usize)>,
+        op_shortcuts: &Vec<Vec<(K, ArcSwapOption<WriteCell<V>>)>>,
+    ) -> (Self, usize) {
         let num_cpus = num_cpus::get();
 
-        let (max_dependency_len, data) = Self::split_merge(num_cpus, 0, possible_writes, op_shortcuts);
+        let (max_dependency_len, data) =
+            Self::split_merge(num_cpus, 0, possible_writes, op_shortcuts);
         (StaticMVHashMap { data }, max_dependency_len)
     }
 }
@@ -421,13 +406,6 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
         Ok(ret)
     }
 
-    pub fn set_dirty(&self, key: &K, version: Version, retry_num: usize) {
-        let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
-
-        // TODO: just update the entry. Later even with shortcut (and no need for wlock).
-        map.insert(version, Arc::from(WriteCell::new_from(FLAG_DIRTY, retry_num, None)));
-    }
-
     pub fn skip(&self, key: &K, version: Version) {
         let mut map = self.data.entry(key.clone()).or_insert(BTreeMap::new());
 
@@ -453,7 +431,6 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
                     // if *entry_key < version {
                     let flag = entry_val.flag.load(Ordering::SeqCst);
 
-
                     if flag == FLAG_DONE {
                         return Ok((
                             (**entry_val.data.load()).clone(),
@@ -471,11 +448,9 @@ impl<K: Hash + Clone + Eq, V: Clone> DynamicMVHashMap<K, V> {
 
                     // The entry is populated so return its contents
 
-
                     if flag == FLAG_SKIP {
                         continue;
                     }
-
 
                     unreachable!();
                     // }

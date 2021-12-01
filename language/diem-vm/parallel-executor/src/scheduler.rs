@@ -2,7 +2,10 @@ use std::cmp::min;
 use std::collections::HashMap;
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use crate::{errors::Error, task::{ExecutionStatus, Transaction, TransactionOutput}};
+use crate::{
+    errors::Error,
+    task::{ExecutionStatus, TransactionOutput},
+};
 use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::SegQueue;
@@ -53,8 +56,7 @@ pub struct STMStatus<K, T, V, E> {
     // Can take once.
     output: RwLock<Option<ExecutionStatus<T, Error<E>>>>,
 
-    shortcuts: Arc<HashMap<K, Arc<WriteCell<V>>>>,
-
+    shortcuts: ArcSwapOption<HashMap<K, Arc<WriteCell<V>>>>,
 }
 
 impl<K, T: TransactionOutput, V, E: Send + Clone> STMStatus<K, T, V, E> {
@@ -67,29 +69,18 @@ impl<K, T: TransactionOutput, V, E: Send + Clone> STMStatus<K, T, V, E> {
         &self.input
     }
 
-    // executed() must hold, i.e. input_output != None. Returns a reference to the inner writeset.
-    pub fn write_set(
-        &self,
-    ) -> Vec<(
-        <<T as TransactionOutput>::T as Transaction>::Key,
-        <<T as TransactionOutput>::T as Transaction>::Value,
-    )> {
-        let output = self.output.read().unwrap();
-        let t = match output.as_ref().unwrap() {
-            ExecutionStatus::Success(t) => t,
-            ExecutionStatus::SkipRest(t) => t,
-            ExecutionStatus::Abort(_) => return Vec::new(),
-        };
-        return t.get_writes();
+    pub fn mark_shortcuts_dirty(&self) {
+        self.shortcuts
+            .load()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .for_each(|(_, cell)| cell.mark_dirty());
     }
 
-    pub fn shortcuts(&self) -> Arc<HashMap<K, Arc<WriteCell<V>>>>{
-        Arc::clone(&self.shortcuts)
+    pub fn take_shortcuts(&self) -> Arc<HashMap<K, Arc<WriteCell<V>>>> {
+        self.shortcuts.swap(None).unwrap()
     }
-
-    // pub fn take_shortcuts(&self) -> HashMap<K, Arc<WriteCell<<<T as TransactionOutput>::T as Transaction>::Value>>>{
-    //     self.shortcuts.unwrap().take().unwrap() //maybe need a lock
-    // }
 
     pub fn output(&self) -> ExecutionStatus<T, Error<E>> {
         self.output.write().unwrap().take().unwrap()
@@ -128,7 +119,7 @@ pub struct Scheduler<K, T, V, E> {
     exec_ids: Vec<CachePadded<AtomicUsize>>,
 }
 
-impl<K, T: TransactionOutput, V,  E: Send + Clone> Scheduler<K, T, V, E> {
+impl<K, T: TransactionOutput, V, E: Send + Clone> Scheduler<K, T, V, E> {
     pub fn new(num_txns: usize) -> Self {
         Self {
             execution_marker: AtomicUsize::new(0),
@@ -325,7 +316,7 @@ impl<K, T: TransactionOutput, V,  E: Send + Clone> Scheduler<K, T, V, E> {
             exec_id: exec_id + 1,
             input,
             output: RwLock::new(Some(output)),
-            shortcuts: Arc::from(shortcuts),
+            shortcuts: ArcSwapOption::from(Some(Arc::from(shortcuts))),
         })));
         self.exec_ids[version].store(exec_id + 1, Ordering::SeqCst);
 

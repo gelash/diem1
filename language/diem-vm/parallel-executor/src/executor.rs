@@ -8,9 +8,11 @@ use crate::{
     task::{ExecutionStatus, ExecutorTask, ReadWriteSetInferencer, Transaction, TransactionOutput},
 };
 use anyhow::{bail, Result as AResult};
+use arc_swap::ArcSwapOption;
 use mvhashmap::{MVHashMap, Version, WriteCell};
 use num_cpus;
 use rayon::{prelude::*, scope};
+use std::collections::HashMap;
 use std::{
     cmp::{max, min},
     collections::HashSet,
@@ -23,8 +25,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use std::collections::HashMap;
-use arc_swap::ArcSwapOption;
 
 pub struct MVHashMapView<'a, K, V, T, E> {
     map: &'a MVHashMap<K, V>,
@@ -38,12 +38,12 @@ pub struct MVHashMapView<'a, K, V, T, E> {
 const NOTHING_ITER_THRESHOLD: usize = 10000;
 
 impl<
-    'a,
-    K: PartialOrd + Send + Clone + Hash + Eq + Sync,
-    V: Clone + Send + Sync,
-    T: TransactionOutput,
-    E: Send + Clone,
-> MVHashMapView<'a, K, V, T, E>
+        'a,
+        K: PartialOrd + Send + Clone + Hash + Eq + Sync,
+        V: Clone + Send + Sync,
+        T: TransactionOutput,
+        E: Send + Clone,
+    > MVHashMapView<'a, K, V, T, E>
 {
     // Drains the reads.
     pub fn drain_reads(&self) -> Vec<ReadDescriptor<K>> {
@@ -109,25 +109,10 @@ impl<
         if original_estimates.contains(k) {
             Ok(self.map.write_to_static(k, version, exec_id, data).unwrap())
         } else {
-            Ok(self.map
+            Ok(self
+                .map
                 .write_to_dynamic(k, version, exec_id, data)
                 .unwrap())
-        }
-    }
-
-    pub fn mark_dirty(
-        &self,
-        version: usize,
-        exec_id: usize,
-        original_estimates: &HashSet<K>,
-        actual_writes: &Vec<(K, V)>,
-    ) {
-        for (k, _) in actual_writes {
-            if !original_estimates.contains(k) {
-                self.map.set_dirty_to_dynamic(k, version, exec_id);
-            } else {
-                self.map.set_dirty_to_static(k, version, exec_id).unwrap();
-            }
         }
     }
 
@@ -157,10 +142,10 @@ pub struct ParallelTransactionExecutor<T: Transaction, E: ExecutorTask, I: ReadW
 }
 
 impl<T, E, I> ParallelTransactionExecutor<T, E, I>
-    where
-        T: Transaction,
-        E: ExecutorTask<T=T>,
-        I: ReadWriteSetInferencer<T=T>,
+where
+    T: Transaction,
+    E: ExecutorTask<T = T>,
+    I: ReadWriteSetInferencer<T = T>,
 {
     pub fn new(inferencer: I) -> Self {
         Self {
@@ -189,11 +174,10 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         // Get the read and write dependency for each transaction.
         let infer_result = self.inferencer.result(&signature_verified_block);
 
-
         //TODO: make this parallel.
         let mut op_shortcuts: Vec<Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)>> = Vec::new();
-        for accesses in infer_result.iter(){
-            let vec:Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)> = accesses
+        for accesses in infer_result.iter() {
+            let vec: Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)> = accesses
                 .keys_written
                 .clone()
                 .into_iter()
@@ -201,7 +185,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                 .collect();
             op_shortcuts.push(vec);
         }
-
 
         // let op_shortcuts: Vec<Vec<(T::Key, ArcSwapOption<WriteCell<T::Value>>)>> = infer_result
         //     .par_iter()
@@ -219,16 +202,14 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         //     })
         //     .collect();
 
-
         // Use write analysis result to construct placeholders.
         let path_version_tuples: Vec<(T::Key, usize, usize)> = infer_result
             .par_iter()
             .enumerate()
             .with_min_len(chunks_size)
             .fold(Vec::new, |mut acc, (txn_idx, accesses)| {
-
                 let mut short_idx = 0;
-                for path in accesses.keys_written.clone(){
+                for path in accesses.keys_written.clone() {
                     acc.push((path, txn_idx, short_idx));
                     short_idx += 1;
                 }
@@ -248,14 +229,18 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         let (versioned_data_cache, max_dependency_level) =
             MVHashMap::new_from_parallel(path_version_tuples, &op_shortcuts);
 
-        let mut original_shortcuts: Vec<ArcSwapOption<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> = Vec::new();
+        let mut original_shortcuts: Vec<ArcSwapOption<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> =
+            Vec::new();
+        // let mut original_shortcuts: Vec<Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>>> =
+        // Vec::new();
 
-        for v in op_shortcuts{
+        for v in op_shortcuts {
             let mut map = HashMap::new();
-            for (k, shortcut) in v{
+            for (k, shortcut) in v {
                 map.insert(k, shortcut.swap(None).unwrap());
             }
             original_shortcuts.push(ArcSwapOption::from(Some(Arc::from(map))));
+            // original_shortcuts.push(Arc::from(map));
         }
         let original_shortcuts = original_shortcuts; //Amaizing code!
 
@@ -266,7 +251,6 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
         //     .map(|k, arc_swap_option| (k, Arc::from(arc_swap_option.load_full().unwrap())))
         //     .collect()
         //     .collect();
-
 
         let outcomes = OutcomeArray::new(num_txns);
 
@@ -351,14 +335,14 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         // validating, all prior txn's must have been executed already).
                         let valid = versioned_data_cache.dynamic_empty()
                             || status_to_validate.read_set().iter().all(|r| {
-                            match state_view.read_map(r.path()) {
-                                Ok((_, version, exec_id)) => {
-                                    r.validate(Some((version, exec_id)))
+                                match state_view.read_map(r.path()) {
+                                    Ok((_, version, exec_id)) => {
+                                        r.validate(Some((version, exec_id)))
+                                    }
+                                    Err(Some(_)) => false, //dependency implies validation failure.
+                                    Err(None) => r.validate(None),
                                 }
-                                Err(Some(_)) => false, //dependency implies validation failure.
-                                Err(None) => r.validate(None),
-                            }
-                        });
+                            });
                         //local_validation_read_time += read_timer.elapsed();
 
                         if !valid && scheduler.abort(version_to_validate, &status_to_validate) {
@@ -367,20 +351,10 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                             // Set dirty in both static and dynamic mvhashmaps.
                             //let write_timer = Instant::now();
 
-                            for (_,cell) in status_to_validate.shortcuts().as_ref().into_iter(){
-                                cell.dirty();
-                            }
-
-                            // state_view.mark_dirty(
-                            //     version_to_validate,
-                            //     status_to_validate.exec_id(),
-                            //     &infer_result[version_to_validate]
-                            //         .keys_written
-                            //         .iter()
-                            //         .cloned()
-                            //         .collect(),
-                            //     &status_to_validate.write_set(),
-                            // );
+                            status_to_validate.mark_shortcuts_dirty();
+                            // for (_, cell) in status_to_validate.shortcuts().as_ref().into_iter() {
+                            //     cell.dirty();
+                            // }
 
                             ret = scheduler.schedule_txn(version_to_validate, self.num_cpus / 4, o);
 
@@ -564,43 +538,54 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                         //         .collect()
                         // };
 
-
                         // prev write set has already been marked dirty! similarly,
                         // the estimates are marked as Unassigned. So future transactions
                         // only need revalidation when there is a write outside of the
                         // prev_write_set.
 
                         let mut writes_outside = false;
-                        let arc_prev_shortcuts: Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>> = if exec_id == 0 {
-                            original_shortcuts[txn_to_execute].load_full().unwrap()
+
+                        let arc_prev_shortcuts: Arc<HashMap<T::Key, Arc<WriteCell<T::Value>>>> =
+                        // let mut prev_shortcuts: &mut HashMap<T::Key, Arc<WriteCell<T::Value>>> =
+                            if exec_id == 0 {
+                                original_shortcuts[txn_to_execute].swap(None).unwrap()
+                                // Arc::get_mut(&mut original_shortcuts[txn_to_execute]).unwrap()
+                            } else {
+                                txn_status.unwrap().take_shortcuts()
+                            };
+
+                        let mut prev_shortcuts = if let Ok(x) = Arc::try_unwrap(arc_prev_shortcuts)
+                        {
+                            x
                         } else {
-                            txn_status.unwrap().shortcuts()
+                            unreachable!();
                         };
-                        let mut new_shortcuts: HashMap<T::Key, Arc<WriteCell<T::Value>>> = HashMap::new();
+
+                        let mut new_shortcuts: HashMap<T::Key, Arc<WriteCell<T::Value>>> =
+                            HashMap::new();
                         //TODO save the clone.
-                        let mut prev_shortcuts= (&*arc_prev_shortcuts).clone();
+                        // let mut prev_shortcuts = (*arc_prev_shortcuts).clone();
 
                         let mut write = |k: T::Key, v: T::Value| -> bool {
                             // if let Some(shortcut) = shortcuts.get(k) {
                             //     shortcut.write(Some(v), exec_id);
                             //     true
                             // } else {
-                            if let Ok(shortcut) = state_view
-                                .write(
-                                    &k,
-                                    txn_to_execute,
-                                    exec_id,
-                                    Some(v),
-                                    &original_estimates,
-                                    &mut prev_shortcuts,
-                                    &mut writes_outside,
-                                ) {
+                            if let Ok(shortcut) = state_view.write(
+                                &k,
+                                txn_to_execute,
+                                exec_id,
+                                Some(v),
+                                &original_estimates,
+                                &mut prev_shortcuts,
+                                &mut writes_outside,
+                            ) {
                                 new_shortcuts.insert(k, shortcut);
                                 true
                             } else {
                                 false
                             }
-                        //}
+                            //}
                         };
 
                         let commit_result = match execute_result {
@@ -608,9 +593,7 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                                 //TODO: first check shortcuts. Otherwise set write_outside and the code below
 
                                 // Commit the side effects to the versioned_data_cache.
-                                if output.get_writes().into_iter().all(|(k, v)| {
-                                    write(k, v)
-                                }) {
+                                if output.get_writes().into_iter().all(|(k, v)| write(k, v)) {
                                     ExecutionStatus::Success(output)
                                 } else {
                                     //TODO: the error below is not relevant anymore.
@@ -622,9 +605,7 @@ impl<T, E, I> ParallelTransactionExecutor<T, E, I>
                             }
                             ExecutionStatus::SkipRest(output) => {
                                 // Commit and skip the rest of the transactions.
-                                if output.get_writes().into_iter().all(|(k, v)| {
-                                    write(k, v)
-                                }) {
+                                if output.get_writes().into_iter().all(|(k, v)| write(k, v)) {
                                     scheduler.set_stop_version(txn_to_execute + 1);
                                     ExecutionStatus::SkipRest(output)
                                 } else {
